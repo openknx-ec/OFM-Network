@@ -49,6 +49,7 @@ class NetworkModule : public OpenKNX::Module
     void fillNetworkFile(UsbExchangeFile *file);
     #ifdef HAS_WIFI
     void readWifiSettingsFromFile();
+    void checkNetworkAvailability(const char *target_ip="1.1.1.1", uint8_t ping_attempts = 5);
     #endif
 #endif
     void registerCallback(NetworkChangeCallback callback);
@@ -95,8 +96,8 @@ class NetworkModule : public OpenKNX::Module
     void handleMDNS();
 
 #ifdef HAS_WIFI
-    char _wifiSSID[33] = {};
-    char _wifiPassphrase[64] = {};
+    char _wifiSSID[33] = {"G3m1n1S3rv3r - IoT"};
+    char _wifiPassphrase[64] = {"S1ch3r99"};
 #endif
 
     std::vector<NetworkChangeCallback> _callback;

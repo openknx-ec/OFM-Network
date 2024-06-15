@@ -1,6 +1,10 @@
 #include "NetworkModule.h"
 #include "ModuleVersionCheck.h"
 
+#ifdef HAS_WIFI
+    #include <IPAddress.h>
+#endif
+
 #define MDNS_DEBUG_PORT Serial
 #define OPENKNX_MDNS_FULL
 
@@ -573,6 +577,82 @@ bool NetworkModule::processCommand(const std::string cmd, bool debugKo)
         logInfoP("Connecting to WiFi \"%s\"", _wifiSSID);
         // KNX_NETIF.disconnect();
         KNX_NETIF.begin(_wifiSSID, _wifiPassphrase);
+    }
+    else if (cmd == "net scan")
+    {
+        auto cnt = WiFi.scanNetworks();
+        if (!cnt)
+        {
+            logInfoP("No networks found");
+        }
+        else
+        {
+            logInfoP("Found %d networks", cnt);
+            logInfoP("%-5s %-17s %-32s %-6s %-2s %-4s", "Index", "BSSID", "SSID", "ENC", "CH", "RSSI");
+            for (auto i = 0; i < cnt; i++)
+            {
+                uint8_t bssid[6];
+                WiFi.BSSID(i, bssid);
+                char bssidStr[18];
+                snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+                const char *encryptionString = 
+                    WiFi.encryptionType(i) == ENC_TYPE_NONE ? "NONE" :
+                    WiFi.encryptionType(i) == ENC_TYPE_TKIP ? "WPA"  :
+                    WiFi.encryptionType(i) == ENC_TYPE_CCMP ? "WPA2" : 
+                    WiFi.encryptionType(i) == ENC_TYPE_AUTO ? "AUTO" : "UNKN";
+                const char *rssiEvaluation =
+                    WiFi.RSSI(i) <= -100 ? "Very Bad" : (WiFi.RSSI(i) <= -80 ? "Bad" : (WiFi.RSSI(i) <= -70 ? "Fair" : (WiFi.RSSI(i) <= -50 ? "Good" : "Excellent")));
+                logInfoP("%-5d %-17s %-32s %-6s %-2d %-4ld (%s)", i, bssidStr, WiFi.SSID(i), encryptionString, WiFi.channel(i), WiFi.RSSI(i), rssiEvaluation);
+            }
+        }
+        return true;
+    }
+    else if (cmd.find("p@") == 0)
+    {
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            logInfoP("Not connected");
+            return true;
+        }
+        size_t pos = cmd.find('@');
+        if (pos == std::string::npos || pos == cmd.size() - 1)
+        {
+            logInfoP("Invalid command format");
+            return true;
+        }
+
+        std::string ipString = cmd.substr(pos + 1);
+        IPAddress targetIP;
+        if (!targetIP.fromString(ipString.c_str()))
+        {
+            uint8_t part1, part2, part3, part4;
+            if(sscanf(ipString.c_str(), "%3d%3d%3d%3d", &part1, &part2, &part3, &part4) == 4 
+                && part1 <= 255 
+                && part2 <= 255 
+                && part3 <= 255 
+                && part4 <= 255 )
+            {
+                targetIP = IPAddress(part1, part2, part3, part4);
+            }
+            else
+            {
+                logInfoP("Invalid IP address: %s", ipString.c_str());
+                return true;
+            }
+        }
+        logInfoP("Pinging %s", targetIP.toString().c_str());
+        auto start = millis();
+        auto res = WiFi.ping(targetIP);
+        auto end = millis();
+
+        if (res >= 0)
+        {
+            logInfoP("Ping OK in %ld ms", end - start);
+        }
+        else
+        {
+            logInfoP("Ping failed");
+        }
         return true;
     }
 #else
@@ -623,6 +703,11 @@ void NetworkModule::showNetworkInformations(bool console)
 #ifdef HAS_WIFI
     std::string wifiInfo = std::string(_wifiSSID) + " (" + std::to_string(KNX_NETIF.RSSI()) + "dBm)";
     logInfoP("Wifi: %s", wifiInfo.c_str());
+
+    //logInfoP("Wifi: %s (%02X:%02X:%02X:%02X:%02X:%02X, %ddBm)", _wifiSSID,
+    //     KNX_NETIF.BSSID(0)[0], KNX_NETIF.BSSID(0)[1], KNX_NETIF.BSSID(0)[2],
+    //     KNX_NETIF.BSSID(0)[3], KNX_NETIF.BSSID(0)[4], KNX_NETIF.BSSID(0)[5],
+    //     KNX_NETIF.RSSI());
 #endif
 
     if (console)
@@ -638,6 +723,8 @@ void NetworkModule::showHelp()
 
 #ifdef HAS_WIFI
     if (strlen(_wifiSSID) > 0) openknx.console.printHelpLine("net recon", "Reconnect to network");
+    openknx.console.printHelpLine("net scan", "Scan for networks");
+    openknx.console.printHelpLine("p@", "Ping IP");
 #else
     if (!_useStaticIP) openknx.console.printHelpLine("net renew", "Renew DHCP Address");
 #endif
