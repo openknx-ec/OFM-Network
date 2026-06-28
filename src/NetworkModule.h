@@ -43,6 +43,12 @@ namespace OpenKNX::Led {
     extern uint32_t g_ipLedActivity;
 }
 
+// KNX-IP-Status LED func id (vs Netzwerkstatus = 10 = link+IP only). Enum (ETS dropdown)
+// lives in Network.share.xml. GREEN only when KNXnet/IP really runs, RED when it is down.
+#ifndef OPENKNX_LEDFUNC_KNXIP_STATE
+#define OPENKNX_LEDFUNC_KNXIP_STATE 11
+#endif
+
 typedef std::function<void(bool)> NetworkChangeCallback;
 
 class NetworkModule : public OpenKNX::Module
@@ -106,6 +112,8 @@ class NetworkModule : public OpenKNX::Module
     bool _otaHandle = false;
     uint8_t _ipLedState = 0;
     OpenKNX::Led::FunctionGroup* _ipLedFunc = nullptr;
+    uint8_t _knxIpLedState = 0;
+    OpenKNX::Led::FunctionGroup* _knxIpLedFunc = nullptr;
 
 #ifdef ARDUINO_ARCH_ESP32
     const uint16_t _otaPort = 3232;
@@ -139,6 +147,8 @@ class NetworkModule : public OpenKNX::Module
     void loadSettings();
     void checkLinkStatus();
     void checkIpStatus();
+    void checkKnxIpStatus();
+    bool knxIpEnabled();
     void loadCallbacks(bool state);
     void handleMDNS();
     void handleOTA();
