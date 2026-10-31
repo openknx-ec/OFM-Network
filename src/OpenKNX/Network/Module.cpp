@@ -841,6 +841,12 @@ namespace OpenKNX
                 return true;
             }
 
+            else if (cmd == "net ?" || cmd == "net help")
+            {
+                showNetworkHelp();
+                return true;
+            }
+
 #if MASK_VERSION == 0x091A || MASK_VERSION == 0x57B0
             else if (cmd == "net mc")
             {
@@ -869,7 +875,7 @@ namespace OpenKNX
                 return true;
             }
 
-#ifdef OPENKNX_WEBSERVER
+#if defined(OPENKNX_WEBSERVER) && defined(OPENKNX_CONSOLE_DEV)
             else if (cmd == "webserver log")
             {
                 bool enabled = !webserver.accessLog();
@@ -1012,9 +1018,12 @@ namespace OpenKNX
             logEnd();
         }
 
+        // Main console help: only the entry points. Every 'net ...' subcommand lives in 'net ?' so the
+        // general help stays readable on products that pull in half a dozen network features.
         void Module::showHelp()
         {
             openknx.console.printHelpLine("net, n", "Show network informations");
+            openknx.console.printHelpLine("net ?", "Network commands (link, diagnostics, reset)");
 
 #ifdef KNX_IP_WIFI
 
@@ -1028,12 +1037,21 @@ namespace OpenKNX
 #if MASK_VERSION == 0x091A || MASK_VERSION == 0x57B0
             // openknx.console.printHelpLine("net mc [address|reset]", "Get/Set multicast address");
 #endif
-            openknx.console.printHelpLine("net reset", "Reset network adapter");
-#ifdef OPENKNX_WEBSERVER
+#if defined(OPENKNX_WEBSERVER) && defined(OPENKNX_CONSOLE_DEV)
             openknx.console.printHelpLine("webserver log", "Toggle webserver access log (2xx/3xx)");
 #endif
 #ifdef OPENKNX_PING
             openknx.console.printHelpLine("ping x.x.x.x", "Ping an IP address");
+#endif
+        }
+
+        // 'net ?' -- every 'net ...' subcommand this build actually has.
+        void Module::showNetworkHelp()
+        {
+            openknx.console.printHelpLine("net, n", "Show network informations");
+            openknx.console.printHelpLine("net reset", "Reset network adapter");
+#if MASK_VERSION == 0x091A || MASK_VERSION == 0x57B0
+            openknx.console.printHelpLine("net mc [address|reset]", "Get/Set multicast address");
 #endif
         }
 

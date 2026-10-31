@@ -102,6 +102,7 @@ namespace OpenKNX
             void showInformations() override;
             bool processCommand(const std::string cmd, bool debugKo);
             void showHelp() override;
+            void showNetworkHelp(); // 'net ?': every 'net ...' subcommand (the main help only points here)
             void showNetworkInformations(bool console = false);
 
             bool processFunctionProperty(uint8_t objectIndex, uint8_t propertyId, uint8_t length, uint8_t *data, uint8_t *resultData, uint8_t &resultLength) override;
