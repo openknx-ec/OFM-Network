@@ -189,8 +189,9 @@ Only `onConnect(fd, true)` is delivered from `loop()` and may do as much as it l
 initial per-client state belongs. Its counterpart, the disconnect notification, deliberately stays
 immediate so a recycled slot cannot have the *new* client's state torn down by a late callback.
 
-**Route handlers** (`addRoute()`) run in the loop on both platforms — on RP2040 with the lwIP lock
-held, so the ethernet interrupt cannot free the connection while its response is being built. Do not
+**Route handlers** (`addRoute()`) do not run on the same task everywhere — on RP2040 in the loop with
+the lwIP lock held, so the ethernet interrupt cannot free the connection while its response is being
+built; on ESP32 in the `esp_http_server` task, see *Requests are not always on the loop task*. Do not
 wait for the network inside one (blocking DNS, a synchronous HTTP client): the reply cannot be
 processed before the handler returns.
 
@@ -272,7 +273,15 @@ contribute one without a single line of code being added here.
 `webserver.isRunning()`.
 
 `_routes`, `_menu`, `_stylesheets` and `_scripts` are plain vectors that are only ever appended to and
+are never cleared. `Webserver::setup()` only registers its own entries; the listening port is opened
+separately by `start()`, once every module has registered. The route list is walked when a **request
+arrives**, and the asset lists when a **page is rendered**. Registration is therefore fully decoupled
+from the server lifecycle: entries added long before the network is even up are in place the moment the
+server answers its first request.
 
+This also means you must not re-register on a link loss. `setup()` is guarded by `_initialized` and
+there is no teardown path, so it runs exactly once per boot and your entries simply stay — registering
+again would duplicate the route and the menu item.
 
 ### The three steps
 
@@ -312,6 +321,11 @@ and `openknxNetwork` stays undefined. Keying on `__has_include` alone breaks the
 - **Asset order in `<head>`.** Assets registered before `Webserver::setup()` runs are emitted *before*
   `base.css`. This only matters where your selectors compete with base.css at equal specificity; a
   class-based selector (`.mypage-bar button`) always wins over base.css's bare element selectors.
+- **Script order, and `window.OpenKNX`.** The same ordering applies to scripts, and there it has teeth:
+  `base.js` is registered inside `Webserver::setup()`, which runs from `Module::loop()` once the link is
+  up, while your own `setup()` runs at boot. Every script is emitted with `defer`, and deferred scripts
+  execute in document order — so a script registered from a module `setup()` runs *before* `base.js`, at
+  a point where `window.OpenKNX` does not exist yet. Use it from a `DOMContentLoaded` handler only.
 - **`main` is a flex column.** A block-level child stretches to the full page width. Use
   `width: fit-content; align-self: start` for anything that should only be as wide as its content
   (an image frame, a card).
@@ -451,10 +465,12 @@ traffic, because every received message resets the timer. The `pong` is a broadc
 resets the timer in every other open tab — the rate stays at roughly one ping per second in total,
 however many pages are open.
 
-`base.js` is registered first and loaded with `defer` on every page, so `window.OpenKNX` exists
-before any page script runs. It opens one socket, derives the scheme from `location.protocol`
-(`wss:` under HTTPS) and reconnects with a 1 s → 30 s backoff. A throwing handler is caught per
-callback so it cannot take the socket down with it.
+`base.js` is loaded with `defer` on every page, but it is registered from `Webserver::setup()`, so a
+script registered earlier from a module `setup()` runs before it — see *Script order, and
+`window.OpenKNX`*. Reach for `window.OpenKNX` from a `DOMContentLoaded` handler, not at top level.
+It opens one socket, derives the scheme from `location.protocol` (`wss:` under HTTPS) and reconnects
+with a 1 s → 30 s backoff. A throwing handler is caught per callback so it cannot take the socket
+down with it.
 
 ---
 
