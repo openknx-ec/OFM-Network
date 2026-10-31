@@ -909,9 +909,12 @@ namespace OpenKNX
                     {
                         if (s->uriTooLong)
                         {
-                            // Otherwise the truncated URI would be routed silently
+                            // Otherwise the truncated URI would be routed silently. Body kept so a
+                            // human sees the reason; 20 ASCII bytes, keep it in step with Content-Length.
                             static const char resp414[] =
-                                "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                "HTTP/1.1 414 URI Too Long\r\nContent-Type: text/plain\r\n"
+                                "Content-Length: 20\r\nConnection: close\r\n\r\n"
+                                "Anfragezeile zu lang";
                             ret = rejectRequest(s, resp414, sizeof(resp414) - 1);
                         }
                         else if (s->contentLength == 0)
