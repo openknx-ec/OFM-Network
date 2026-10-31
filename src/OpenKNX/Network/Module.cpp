@@ -85,7 +85,7 @@ namespace OpenKNX
             delay(500);
             initPhy();
             initIp();
-            controlKnxIp(true);
+            controlKnxIp(true); // ESP32: the pending STOP/START down request closes it again; GOT_IP or the link check re-opens it
 
             logInfoP("Complete");
             logIndentDown();
@@ -211,14 +211,6 @@ namespace OpenKNX
 #else
             KNX_NETIF.hostname(_hostName);
 #endif
-
-#ifdef ARDUINO_ARCH_ESP32
-#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-            ::Network.onEvent([](arduino_event_id_t event) -> void { openknxNetwork.esp32NetworkEvent(event); });
-#else
-            WiFi.onEvent([](WiFiEvent_t event) -> void { openknxNetwork.esp32NetworkEvent(event); });
-#endif
-#endif
         }
 
         void Module::init()
@@ -227,11 +219,22 @@ namespace OpenKNX
             logIndentUp();
             initPhy();
             loadSettings();
+#ifdef ARDUINO_ARCH_ESP32
+            // Once only: applyLocalNetworkConfig() re-runs loadSettings(), and a second callback would be appended.
+#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+            ::Network.onEvent([](arduino_event_id_t event) -> void { openknxNetwork.esp32NetworkEvent(event); });
+#else
+            WiFi.onEvent([](WiFiEvent_t event) -> void { openknxNetwork.esp32NetworkEvent(event); });
+#endif
+#endif
             initIp();
             logIndentDown();
         }
 
 #ifdef ARDUINO_ARCH_ESP32
+        /**
+         * @brief Runs on the "arduino_events" task; KNX-IP changes are only recorded here, loop() applies them.
+         */
         void Module::esp32NetworkEvent(CALLBACK_EVENT event)
         {
             switch (event)
@@ -245,7 +248,7 @@ namespace OpenKNX
                     // The hostname must be set after the interface is started, but needs
                     // to be set before DHCP, so set it from the event handler thread.
                     KNX_NETIF.setHostname(_hostName);
-                    controlKnxIp(false);
+                    requestKnxIp(false);
 
                     break;
                 case ARDUINO_EVENT_ETH_CONNECTED:
@@ -255,38 +258,61 @@ namespace OpenKNX
                     break;
                 case ARDUINO_EVENT_ETH_GOT_IP:
                 case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-                {
                     logDebugP("Event: Got IP");
-                    // Rebind kostet Telegramme, daher nur bei echtem IP-Wechsel.
-                    IPAddress ip = localIP();
-                    if (ip != _boundIp)
-                    {
-                        controlKnxIp(false);
-                        controlKnxIp(true);
-                        _boundIp = ip;
-                    }
+                    requestKnxIp(true);
                     break;
-                }
                 case ARDUINO_EVENT_ETH_LOST_IP:
                 case ARDUINO_EVENT_WIFI_STA_LOST_IP:
                     logDebugP("Event: Lost IP");
-                    controlKnxIp(false);
+                    requestKnxIp(false);
                     break;
                 case ARDUINO_EVENT_ETH_DISCONNECTED:
                 case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
                     logDebugP("Event: Disconnected");
-                    controlKnxIp(false);
+                    requestKnxIp(false);
                     espConnected = false;
                     break;
                 case ARDUINO_EVENT_ETH_STOP:
                 case ARDUINO_EVENT_WIFI_STA_STOP:
                     logDebugP("Event: Stop");
-                    controlKnxIp(false);
+                    requestKnxIp(false);
                     espConnected = false;
                     break;
                 default:
                     logDebugP("Event: Ignored %i", event);
                     break;
+            }
+        }
+
+        /**
+         * @brief Event task: a down event replaces any pending request with DOWN; GOT_IP adds REBIND to it.
+         * The last event wins. Router: after a DOWN, the REBIND or the link check in checkLinkStatus() re-joins.
+         */
+        void Module::requestKnxIp(bool rebind)
+        {
+            if (rebind)
+                _knxIpRequest.fetch_or(KNXIP_REQ_REBIND, std::memory_order_release);
+            else
+                _knxIpRequest.exchange(KNXIP_REQ_DOWN, std::memory_order_release); // RMW like the consumer's
+        }
+
+        /**
+         * @brief loop() context: applies the recorded request, DOWN before REBIND (the order they occurred in).
+         * A re-bind costs telegrams, so only on an address change or when the endpoint is not up.
+         */
+        void Module::applyKnxIpRequest()
+        {
+            const uint32_t req = _knxIpRequest.exchange(0, std::memory_order_acquire);
+            if (req & KNXIP_REQ_DOWN) controlKnxIp(false);
+            if (!(req & KNXIP_REQ_REBIND)) return;
+
+            const IPAddress ip = localIP();
+            if (ip == IPAddress()) return; // address gone again; the next GOT_IP requests the bind
+            if (ip != _boundIp || !knxIpEnabled())
+            {
+                controlKnxIp(false);
+                controlKnxIp(true);
+                if (knxIpEnabled()) _boundIp = ip;
             }
         }
 #endif
@@ -540,9 +566,17 @@ namespace OpenKNX
             bool establishedState = established();
 
 #ifdef ARDUINO_ARCH_ESP32
-            // Fängt einen Link-Flap auf, nach dem GOT_IP ausbleibt. Nur ESP32: RP2040 hat
-            // keine Events und damit keine Lücke.
-            controlKnxIp(establishedState);
+            // Level-triggered: follows the link state every tick, so a failing join is retried every 500 ms.
+            // Router masks only: on 0x07B0 controlKnxIp() leaves the endpoint to networkChanged().
+#if MASK_VERSION == 0x091A || MASK_VERSION == 0x57B0
+            const bool knxIpWanted = establishedState;
+            if (knxIpWanted != knxIpEnabled())
+            {
+                const IPAddress ip = localIP();
+                controlKnxIp(knxIpWanted);
+                if (knxIpWanted && knxIpEnabled()) _boundIp = ip; // a GOT_IP for this address skips the rebind while up
+            }
+#endif
 #endif
 
             bool newLinkState;
@@ -642,6 +676,10 @@ namespace OpenKNX
 
         void Module::loop(bool configured)
         {
+#ifdef ARDUINO_ARCH_ESP32
+            // Ahead of the _powerSave/_otaActive returns, so KNX-IP follows the network in every state.
+            if (_knxIpRequest.load(std::memory_order_relaxed)) applyKnxIpRequest();
+#endif
             if (_restartTimer > 0 && delayCheck(_restartTimer, 2000))
             {
                 openknx.restart();
@@ -1302,12 +1340,19 @@ namespace OpenKNX
 
         void Module::controlKnxIp(bool enable)
         {
+#if MASK_VERSION == 0x091A || MASK_VERSION == 0x07B0 || MASK_VERSION == 0x57B0
+            // Compared against the OBSERVED state, never against an intent flag: an intent that drifts from
+            // reality never heals, while this retries exactly when the datalink is not where it should be.
+            if (enable == knxIpEnabled()) return;
+#endif
+            // Not on 0x07B0: Bau07B0IP owns the endpoint and networkChanged() rebuilds it on the link edge; toggling
+            // it here could drop live tunnels. Router masks only.
 #if MASK_VERSION == 0x091A
             knx.bau().getPrimaryDataLinkLayer()->enabled(enable);
 #elif MASK_VERSION == 0x57B0
             knx.bau().getDataLinkLayer()->enabled(enable);
 #endif
-            if (!enable) _boundIp = IPAddress(); // Socket zu, Bindung ungültig
+            if (!enable) _boundIp = IPAddress(); // no address recorded
         }
 
 #if MASK_VERSION == 0x07B0 || MASK_VERSION == 0x091A
@@ -1320,6 +1365,18 @@ namespace OpenKNX
 #endif
         }
 #endif
+        // True while the KNXnet/IP datalink layer is enabled ("KNX-IP is running", distinct from the
+        // physical Ethernet/IP link). Counterpart to controlKnxIp().
+        bool Module::knxIpEnabled()
+        {
+#if MASK_VERSION == 0x091A || (MASK_VERSION == 0x07B0 && defined(KNX_TUNNELING)) // primary datalink = KNXnet/IP (091A router, 07B0 interface Bau07B0IP)
+            return knx.bau().getPrimaryDataLinkLayer()->enabled();
+#elif MASK_VERSION == 0x57B0
+            return knx.bau().getDataLinkLayer()->enabled();
+#else
+            return false;
+#endif
+        }
 
 #ifdef OPENKNX_PING
         void Module::ping(IPAddress target, std::function<void(IPAddress, bool, uint32_t)> callback, uint32_t timeoutMs)

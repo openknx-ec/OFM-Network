@@ -37,6 +37,7 @@
 #if defined(ARDUINO_ARCH_ESP32)
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <atomic>
 #include <vector>
 #if defined(KNX_IP_LAN)
 #include <ETH.h>
@@ -214,10 +215,17 @@ namespace OpenKNX
             IPAddress _staticSubnetMask;
             IPAddress _staticGatewayIP;
             IPAddress _staticNameServerIP;
-            IPAddress _boundIp; // IP, auf die der KNX-Multicast-Socket gebunden ist; leer = nicht gebunden
+            IPAddress _boundIp; // ESP32: address of the last join by REBIND or the link check; a GOT_IP for it skips the rebind while the endpoint is up
 
 #ifdef ARDUINO_ARCH_ESP32
             bool espConnected = false;
+
+            // KNX-IP requests from the network event task, applied by loop(): IpDataLinkLayer is not thread-safe.
+            static constexpr uint32_t KNXIP_REQ_DOWN = 0x01;   // disable (ETH START, LOST_IP, DISCONNECTED, STOP)
+            static constexpr uint32_t KNXIP_REQ_REBIND = 0x02; // GOT_IP: re-bind on an address change or a closed endpoint
+            std::atomic<uint32_t> _knxIpRequest{0};
+            void requestKnxIp(bool rebind);
+            void applyKnxIpRequest();
 #endif
 
             char _hostName[25] = {};
@@ -238,6 +246,7 @@ namespace OpenKNX
             void handleMDNS();
             void handleOTA();
             void controlKnxIp(bool state);
+            bool knxIpEnabled();     // is the KNXnet/IP datalink layer currently enabled?
 
 #ifdef OPENKNX_PING
             OpenKNX::Network::Ping::Handler _pingHandler;
