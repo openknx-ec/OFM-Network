@@ -270,6 +270,12 @@ namespace OpenKNX
             // Feed PHY link edges to lwIP; arduino-pico's W5500 driver doesn't, leaving DHCP on a stale lease.
             void setLwipLinkState(bool up);
 #endif
+#ifdef OPENKNX_NETWORK_AUTOIP
+            // last address reported; it can change while the link stays up (AutoIP/late DHCP).
+            IPAddress _reportedIp;
+            bool _autoIpWaitLogged = false; // "no DHCP answer yet" said once per wait, not every tick
+            void checkIpAssignmentMethod();
+#endif
             // Link-loss bookkeeping, shared by the normal down edge and the W5500 recovery.
             void onLinkLost();
             void initPhy();

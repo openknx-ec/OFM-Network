@@ -6,6 +6,15 @@
 
 #include "DNS.h"
 #include "Module.h"
+
+// ESP32's prebuilt IDF ships autoip.c compiled out, so a -D cannot enable AutoIP -- guard against
+// reporting a method the stack can't do. See doc/TODO-esp32-custom-idf.md. RP2040 builds lwIP from source.
+#if defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_NETWORK_AUTOIP)
+    #include <lwip/opt.h>
+    #if !LWIP_AUTOIP
+        #error "OPENKNX_NETWORK_AUTOIP requires an ESP-IDF built with CONFIG_LWIP_AUTOIP=y - see OFM-Network/doc/TODO-esp32-custom-idf.md"
+    #endif
+#endif
 #include "ModuleVersionCheck.h"
 #include "NtpTimeProvider.h"
 
@@ -590,6 +599,35 @@ namespace OpenKNX
         }
 #endif
 
+#ifdef OPENKNX_NETWORK_AUTOIP
+        // AutoIP: lwIP self-assigns 169.254/16 when no DHCP answers. Report the method actually in use in
+        // PID_CURRENT_IP_ASSIGNMENT_METHOD (03_08_03 2.5.5: 8=AutoIP, 4=DHCP); driven by the address, not the edge.
+        void Module::checkIpAssignmentMethod()
+        {
+            if (_useStaticIP) return; // static/manual config is resolved in loadSettings()
+
+            const IPAddress ip = localIP();
+
+            // say it once; "link up, no address" is normal until the DHCP DISCOVERs time out (~2 min).
+            if (ip == IPAddress())
+            {
+                if (_currentLinkState && !_autoIpWaitLogged && netUptimeSec() >= 20)
+                {
+                    _autoIpWaitLogged = true;
+                    logInfoP("No DHCP answer yet - waiting, link-local fallback follows if none arrives");
+                }
+                return;
+            }
+            _autoIpWaitLogged = false;
+
+            if (ip == _reportedIp) return;
+            _reportedIp = ip;
+
+            const bool linkLocal = (ip[0] == 169 && ip[1] == 254);
+            SetByteProperty(PID_CURRENT_IP_ASSIGNMENT_METHOD, linkLocal ? 8 : 4);
+            logInfoP("IP-Address: %s (%s)", ip.toString().c_str(), linkLocal ? "AutoIP" : "DHCP");
+        }
+#endif
 
         // Link-down housekeeping. Also called by the W5500 recovery, which bypasses checkLinkStatus() and
         // would otherwise leave lwIP's link-up flag set and the DHCP/AutoIP handover unarmed.
@@ -636,21 +674,6 @@ namespace OpenKNX
             loadCallbacks(true);
             logIndentDown();
             logEnd();
-
-#ifdef OPENKNX_NETWORK_AUTOIP
-            // AutoIP (RFC 3927) coop fallback: when no DHCP server answered, lwIP self-assigns a link-local
-            // 169.254.0.0/16 address after LWIP_DHCP_AUTOIP_COOP_TRIES DISCOVERs. Reflect the method actually IN
-            // USE in PID_CURRENT_IP_ASSIGNMENT_METHOD (03_08_03 2.5.5: 8=AutoIP, 4=DHCP) so ETS/ftc report it right.
-            // Evaluated here (IP is valid + link-stable), not in loadSettings() where the IP is not yet known; re-runs
-            // on each reconnect (_ipShown is cleared on link loss). Only the DHCP case is refined -- a static/manual
-            // config keeps the method already resolved in loadSettings().
-            if (!_useStaticIP)
-            {
-                IPAddress ip = localIP();
-                SetByteProperty(PID_CURRENT_IP_ASSIGNMENT_METHOD,
-                                (ip[0] == 169 && ip[1] == 254) ? 8 : 4); // 8 = AutoIP link-local, 4 = DHCP lease
-            }
-#endif
 
             _ipShown = true;
         }
@@ -798,6 +821,11 @@ namespace OpenKNX
             _lastLinkCheck = millis();
 
             if (_currentLinkState) checkIpStatus();
+
+#ifdef OPENKNX_NETWORK_AUTOIP
+            // every tick, not just the edge: AutoIP takes over after the DHCP tries, with the link up all along.
+            if (_currentLinkState) checkIpAssignmentMethod();
+#endif
 
             // set network bit for heartbeat
             if (established())
@@ -1174,7 +1202,14 @@ namespace OpenKNX
 
             if (established())
             {
-                logInfoP(_useStaticIP ? "Using static IP" : "Using DHCP");
+                // 169.254 = DHCP gave up and lwIP self-assigned; "Using DHCP" would misreport it.
+                const IPAddress ip = localIP();
+                if (_useStaticIP)
+                    logInfoP("Using static IP");
+                else if (ip[0] == 169 && ip[1] == 254)
+                    logInfoP("Using AutoIP (no DHCP server answered)");
+                else
+                    logInfoP("Using DHCP");
                 logInfoP("IP-Address: %s", localIP().toString().c_str());
                 logInfoP("Netmask: %s", subnetMask().toString().c_str());
                 logInfoP("Gateway: %s", gatewayIP().toString().c_str());
