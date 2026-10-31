@@ -2171,6 +2171,15 @@ namespace OpenKNX
             return "Auto";
         }
 
+#if MASK_VERSION == 0x07B0 || MASK_VERSION == 0x091A
+        TPUart::DataLinkLayer &Module::tpUart()
+        {
+            // a coupler (KNX_IS_ROUTER) keeps TP on the secondary link (its primary is IP); every other TP
+            // build on the primary. The interface (0x07B0 + tunnelling) is not a router -> getDataLinkLayer().
+            return KNX_TP_DLL->getTPUart();
+        }
+#endif
+
         void Module::savePower()
         {
 #if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
@@ -2446,16 +2455,6 @@ namespace OpenKNX
             if (!enable) _boundIp = IPAddress(); // no address recorded
         }
 
-#if MASK_VERSION == 0x07B0 || MASK_VERSION == 0x091A
-        TPUart::DataLinkLayer &Module::tpUart()
-        {
-#if MASK_VERSION == 0x07B0
-            return knx.bau().getDataLinkLayer()->getTPUart();
-#else
-            return knx.bau().getSecondaryDataLinkLayer()->getTPUart();
-#endif
-        }
-#endif
         // True while the KNXnet/IP datalink layer is enabled ("KNX-IP is running", distinct from the
         // physical Ethernet/IP link). Counterpart to controlKnxIp().
         bool Module::knxIpEnabled()
