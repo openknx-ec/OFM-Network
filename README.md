@@ -30,6 +30,7 @@ This module provides the network functionality for the OpenKNX stack.
 | OPENKNX_WEBCLIENT_MAX_BODY | 4096  | Max request body size (bytes)        |                                              |
 | OPENKNX_WIFI_SCAN        |         | Console `net wifi scan`: lists visible WiFi networks (async) | KNX_IP_WIFI only |
 | OPENKNX_WIFI_AP          |         | Open setup AP `<hostname>` + page `/wifi`, never together with the client: without WiFi credentials, when an unprogrammed device has no client link 30 s after boot, or 5 s after the prog button without a link | Implies OPENKNX_WIFI_SCAN, needs OPENKNX_WEBSERVER; saving needs the AP or programming mode |
+| OPENKNX_OTA_EXCLUSIVE    |         | Dev/test aid: pause KNX and all other modules during OTA | Not for production; needs the OGM-Common version that provides it, see OTA below |
 
 ## IP LED
 
@@ -70,6 +71,11 @@ upload_port = XXX.XXX.XXX.XXX # IP Address or Hostname
 ```
 
 Note: The device hostname can be set in ETS under the Network → mDNS section.
+
+Dev/test aid `-D OPENKNX_OTA_EXCLUSIVE` (not for production): from OTA start to end or error, OGM-Common's `loop()`
+runs only watchdog, LEDs and display; KNX and all other modules pause. OTA calls `openknx.loop()` after every received
+chunk, so a module that blocks there stalls the transfer until espota aborts after 10 s. If OTA fails without the
+switch and passes with it, a blocking module is the cause; fix that module, the switch is not the fix.
 
 ## WiFi module (NETW)
 
