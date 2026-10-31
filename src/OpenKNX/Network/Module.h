@@ -148,6 +148,10 @@ namespace OpenKNX
             const std::string name() override;
             const std::string version() override;
             void init() override;
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+            /** @brief Drains the W5500 for the KNX stack before it sends (knx pollReceive); skipped in power save and OTA. */
+            void pollEthernetRx();
+#endif
             void loop(bool configured) override;
             void setup(bool configured) override;
             void resetNetwork();
@@ -500,6 +504,10 @@ namespace OpenKNX
             void registerOpenknxMdns();
             void forgetOpenknxMdns(); // the interface (and its services) goes away: the next registration starts fresh
             bool _mdnsWasEstablished = false; // rising edge for the re-registration in checkLinkStatus()
+#endif
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+            void pumpEthernet();         // drive W5500 RX + lwIP timers from the main loop (INT off), called from loop()
+            void setEthOtaPump(bool on); // OTA: hand RX to the async IRQ pump so the blocking OTA read isn't loop-starved
 #endif
 #if defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
             // W5500-on-ESP hard-wedge recovery (link-based: esp_eth owns the SPI bus, we cannot raw-read VERSIONR).

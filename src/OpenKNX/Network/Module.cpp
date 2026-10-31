@@ -85,11 +85,22 @@
 
 #if defined(KNX_IP_LAN)
 #include "W5500lwIP.h"
-#ifdef PIN_ETH_INT
-Wiznet5500lwIP KNX_NETIF(PIN_ETH_SS, ETH_SPI_INTERFACE, PIN_ETH_INT);
+// OPENKNX_ETH_W5500_MAINLOOP_RX: build the driver WITHOUT the INT pin so RX is NOT IRQ-driven; we pump the chip
+// from the main loop (pumpEthernet) instead. Fixes two W5500+lwIP bugs with one root -- RX/timers running in a
+// preemptive IRQ under a non-fair lock: the tunnel-flood watchdog reboot and the 30 s mDNS loop stall.
+// OPENKNX_ETH_W5500: own copy of the W5500 driver, driver/W5500Drv (see driver/W5500Drv.md).
+#if defined(OPENKNX_ETH_W5500)
+#include "driver/W5500Drv.h"
+using KnxNetif = LwipIntfDev<W5500Drv>;
 #else
-Wiznet5500lwIP KNX_NETIF(PIN_ETH_SS, ETH_SPI_INTERFACE);
+using KnxNetif = Wiznet5500lwIP;
 #endif
+#if defined(PIN_ETH_INT) && !defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+KnxNetif KNX_NETIF(PIN_ETH_SS, ETH_SPI_INTERFACE, PIN_ETH_INT);
+#else
+KnxNetif KNX_NETIF(PIN_ETH_SS, ETH_SPI_INTERFACE);
+#endif
+
 #elif defined(KNX_IP_WIFI)
 #else
 #pragma warn "Missing KNX_IP_LAN or KNX_IP_WIFI"
@@ -426,6 +437,12 @@ namespace OpenKNX
             logIndentUp();
             initPhy();
             loadSettings();
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
+            RP2040ArduinoPlatform::setNetif(KNX_NETIF.getNetIf());
+#endif
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+            RP2040ArduinoPlatform::setReceivePoll([]() { openknxNetwork.pollEthernetRx(); });
+#endif
 #ifdef ARDUINO_ARCH_ESP32
             // Once only: applyLocalNetworkConfig() re-runs loadSettings(), and a second callback would be appended.
 #if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
@@ -661,6 +678,9 @@ namespace OpenKNX
 #if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
                 phyToolAbort(); // loop() returns before the state machine while OTA runs
 #endif
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+                setEthOtaPump(true); // hand W5500 RX to the async IRQ pump so the blocking OTA read isn't loop-starved
+#endif
                 if (ArduinoOTA.getCommand() == U_FLASH)
                     logInfo("OTA", "Start updating firmware");
                 else // U_SPIFFS
@@ -668,6 +688,9 @@ namespace OpenKNX
             });
             ArduinoOTA.onEnd([&]() {
                 _otaActive = false;
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+                setEthOtaPump(false); // restore the main-loop RX pump (defensive: a restart below could be deferred)
+#endif
                 _otaPercent = 100;
                 logIndentUp();
                 logInfo("OTA", "Update complete");
@@ -688,6 +711,9 @@ namespace OpenKNX
             });
             ArduinoOTA.onError([&](ota_error_t error) {
                 _otaActive = false; // release the display overlay so normal operation resumes
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+                setEthOtaPump(false); // restore the main-loop RX pump -- device keeps running after an OTA error
+#endif
                 logIndentUp();
                 if (error == OTA_AUTH_ERROR)
                     logError("OTA", "Auth error");
@@ -1339,6 +1365,10 @@ namespace OpenKNX
 
             if (_powerSave) return;
 
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+            if (!_otaActive) pumpEthernet(); // drive W5500 RX + lwIP timers from the main loop (INT off);
+                                             // while _otaActive the async IRQ pump owns RX (see setEthOtaPump)
+#endif
             // During OTA the async IRQ pump owns W5500 RX; skip the SPI health-checks (checkEthHealth/
             // checkLinkStatus, and the ping/DNS/webclient loops below) so they don't contend for the SPI bus +
             // lwIP lock in the windows between flash commits. The device is dedicated to the update anyway.
@@ -1947,6 +1977,11 @@ namespace OpenKNX
                     logInfoP("Packets RX/TX: %s / %s", humanCount(rxPackets).c_str(),
                              humanCount(txPackets).c_str());
                 }
+#endif
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500)
+                logInfoP("W5500 socket reopens / close timeouts / command timeouts: %u / %u / %u",
+                         (unsigned)KNX_NETIF.sendReopens(), (unsigned)KNX_NETIF.closeTimeouts(),
+                         (unsigned)KNX_NETIF.cmdTimeouts()); // driver wait bounds that expired
 #endif
                 // logInfoP("Mode: %s", phyMode().c_str()); currently not supported
 
@@ -3080,6 +3115,50 @@ namespace OpenKNX
         }
 #endif
 
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_ETH_W5500_MAINLOOP_RX)
+        // Drive W5500 RX + lwIP timers from the main loop (the driver is built INT-less here). Idle the
+        // framework async timer on the first pass (not in setup(), which would strand boot-time DHCP).
+        void Module::pumpEthernet()
+        {
+            if (_ethDegraded) return;
+
+            static bool asyncTimerIdled = false;
+            if (!asyncTimerIdled)
+            {
+                lwipPollingPeriod(3600000); // effectively never
+                asyncTimerIdled = true;
+            }
+            ethernet_arch_lwip_begin();
+            KNX_NETIF.handlePackets(); // RX
+            // lwIP timers are ms-granularity; throttle to ~1 ms so we don't burn TP-hot-path cycles at the kHz loop rate
+            static uint32_t lastTimeoutMs = 0;
+            uint32_t nowMs = millis();
+            if (nowMs != lastTimeoutMs)
+            {
+                lastTimeoutMs = nowMs;
+                sys_check_timeouts();
+            }
+            ethernet_arch_lwip_end();
+        }
+
+        // knx pollReceive() hook: gated like the pump in loop(); savePower() holds the chip in reset, OTA owns RX.
+        void Module::pollEthernetRx()
+        {
+            if (!_powerSave && !_otaActive) pumpEthernet();
+        }
+
+        // OTA RX handover. The framework OTA read (_runUpdate) is fully blocking and never returns to loop()
+        // mid-transfer, so the once-per-loop pumpEthernet() cannot feed it and the socket RX buffer stalls
+        // (glacial/failing OTA + display hitch). For the transfer we hand RX back to the framework async pump
+        // (HW-alarm IRQ) which fires the W5500 RX drain even inside that blocking read; loop() then skips
+        // pumpEthernet() while _otaActive. 2 ms poll = aggressive OTA RX; on=false restores idle.
+        void Module::setEthOtaPump(bool on)
+        {
+            lwipPollingPeriod(on ? 2 : 3600000); // 2 ms = aggressive OTA RX; 3.6M ms = effectively never (idle)
+            ethernet_arch_lwip_begin();
+            ethernet_arch_lwip_end(); // context-leave -> re-arm the async timeout worker at the new period
+        }
+#endif
 
 #ifdef OPENKNX_PING
         void Module::ping(IPAddress target, std::function<void(IPAddress, bool, uint32_t)> callback, uint32_t timeoutMs)
