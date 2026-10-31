@@ -39,6 +39,9 @@
 #endif
 #include "strings.h"
 #include <functional>
+#if defined(KNX_IP_LAN) && (defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_ARCH_ESP32))
+#include "driver/EthLinkManager.h" // ETH link mode + auto-fallback ladder (self-guarded: W5500 LAN only)
+#endif
 
 #if defined(ARDUINO_ARCH_ESP32)
 #include <ESPmDNS.h>
@@ -57,7 +60,10 @@
 #endif
 
 #ifndef OPENKNX_NET_SPI_SPEED
-#define OPENKNX_NET_SPI_SPEED 28000000
+// 8 MHz is what the bus has actually been running at: the health probe re-clocked it and the Wiznet
+// driver never sets a clock of its own, so the old 28 MHz default was never in effect after boot.
+// Raising it is a separate change that needs its own soak test.
+#define OPENKNX_NET_SPI_SPEED 8000000
 #endif
 
 #if defined(KNX_IP_LAN)
@@ -260,6 +266,16 @@ namespace OpenKNX
             bool _carrierStable = false; // accepted carrier state
             uint8_t _carrierSamples = 0; // consecutive reads disagreeing with _carrierStable
             static constexpr uint8_t LINK_DEBOUNCE_SAMPLES = 3; // 3 x 500ms tick -> 1.5s to accept a change
+
+            // Link up but no usable address: escalate instead of waiting forever. Renew first (no
+            // interruption), then re-initialise the interface -- what a warm reboot does for the network,
+            // without restarting the device.
+            void checkIpWatchdog(bool carrier);
+            uint32_t _noIpSince = 0; // millis() the "carrier up, no usable address" state began (0 = none)
+            uint8_t _noIpStage = 0;  // 0 = nothing done yet, 1 = renewed, 2 = interface re-initialised
+            bool _hadIpEver = false; // gate: a network without a DHCP server must not be churned
+            static constexpr uint32_t NO_IP_RENEW_MS = 60000;
+            static constexpr uint32_t NO_IP_REBIND_MS = 180000;
 #endif
             uint32_t _lastLinkCheck = false;
             uint32_t _ipFaultSince = 0; // millis() the IP network first looked unreachable; 0 = it does not
@@ -274,6 +290,63 @@ namespace OpenKNX
             uint32_t _lastLinkUptimeSec = 0;   // how long the link had been up when it last went down
             uint16_t _reconnects = 0;          // link-up edges after the first one
             bool _linkEverDown = false;        // the first link-up is a connect, not a reconnect
+#if defined(KNX_IP_LAN) && (defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_ARCH_ESP32))
+            EthLinkManager _ethLink{*this}; // ETH link-speed override + auto-fallback ladder (W5500 LAN)
+#endif
+
+            // ---- W5500 clean self-heal (no MCU reboot) ----
+            // The W5500 sometimes doesn't answer right after (re)boot and can wedge after a clean start. At boot
+            // we retry begin() with an RSTn reset between tries; at runtime checkEthHealth() probes VERSIONR and,
+            // on a wedge, recoverEth() re-inits (never the driver's end() alone -> it busy-waits forever on a
+            // stuck chip -> brick). Heals as soon as the chip answers; no reboot needed.
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+            bool _ethDegraded = false;   // true: W5500 not up yet, loop() is running the self-heal retry
+            uint32_t _lastEthHeal = 0;   // millis() of the last self-heal attempt (throttle)
+            uint32_t _lastEthHealth = 0; // millis() of the last runtime chip-health probe (throttle)
+            uint8_t _ethBadProbes = 0;   // consecutive bad health probes (VERSIONR or Sn_SR) before recovery
+            // W5500 socket 0 status. VERSIONR alone cannot see a wedged MACRAW socket: the chip answers on
+            // SPI and the PHY keeps link, yet no packet moves. Registers per datasheet: socket register block
+            // 0x08, Sn_SR at 0x0003, SOCK_MACRAW = 0x42 (the driver opens socket 0 in MACRAW).
+            static constexpr uint8_t W5500_BLOCK_SOCKET0 = 0x08;
+            static constexpr uint16_t W5500_REG_SN_SR = 0x0003;
+            static constexpr uint8_t W5500_SOCK_MACRAW = 0x42;
+            uint8_t readSocketStatusLocked(); // Sn_SR under the lwIP lock
+            void hwResetPhy();           // pulse PIN_ETH_RES (RSTn low >=500us) + settle before any SPI access
+            bool tryBeginEth();          // one clean bring-up: HW reset + KNX_NETIF.begin(), VERSIONR-classify on fail
+            bool beginEthWithRetry();    // boot: tryBeginEth() up to ETH_BEGIN_TRIES with backoff
+            void ethSelfHeal();          // loop(): stepped, non-blocking bring-up retry while _ethDegraded
+            bool beginEthAfterReset();   // setSPISpeed + begin() + VERSIONR classification (no RSTn pulse)
+            uint32_t healIntervalMs() const; // retry spacing, widens with _healFailures
+            void checkEthHealth();       // loop(): periodic VERSIONR probe; recoverEth() on repeated failure
+            void recoverEth();           // runtime: HW-reset -> safe end() -> hand to ethSelfHeal() (no reboot/brick)
+            static constexpr uint8_t ETH_BEGIN_TRIES = 4;
+            static constexpr uint16_t ETH_BEGIN_BACKOFF_MS = 150;
+            static constexpr uint32_t ETH_HEAL_INTERVAL_MS = 5000;
+            static constexpr uint32_t ETH_HEALTH_INTERVAL_MS = 5000;
+            static constexpr uint8_t ETH_BAD_PROBE_LIMIT = 3;
+            // RSTn pulse shape, shared by the blocking boot path and the stepped self-heal. Datasheet 5.5.1:
+            // TRC (reset cycle) >= 500us, TPL (RSTn to internal PLL lock) <= 1ms -- both are generous here.
+            static constexpr uint16_t ETH_RESET_LOW_MS = 2;
+            static constexpr uint16_t ETH_RESET_SETTLE_MS = 60;
+
+            // The self-heal used to burn ETH_RESET_LOW_MS + ETH_RESET_SETTLE_MS inside one loop() pass, every
+            // 5s, forever. On a chip that cannot be healed by RSTn at all that starved the TPUart RX path
+            // (bus protocol errors) and chopped up the console. It now steps through the pulse across loop
+            // passes and widens the retry spacing the longer the chip stays dead.
+            enum class HealStep : uint8_t
+            {
+                Wait,        // between attempts
+                ResetLow,    // RSTn low, waiting out ETH_RESET_LOW_MS
+                ResetSettle, // RSTn released, waiting out ETH_RESET_SETTLE_MS
+            };
+            HealStep _healStep = HealStep::Wait;
+            uint32_t _healAt = 0;      // millis() of the next step
+            uint16_t _healFailures = 0; // consecutive failed bring-ups (drives the backoff)
+            static constexpr uint32_t ETH_HEAL_INTERVAL_SLOW_MS = 30000;
+            static constexpr uint32_t ETH_HEAL_INTERVAL_MAX_MS = 120000;
+            static constexpr uint16_t ETH_HEAL_FAST_TRIES = 3;  // a transient hiccup heals within these
+            static constexpr uint16_t ETH_HEAL_SLOW_TRIES = 10; // then 30s, then 120s
+#endif
 #if defined(ARDUINO_ARCH_RP2040)
             // RP2040 mDNS via the lwIP API directly (SimpleMDNS.addServiceTxt is broken on arduino-pico ->
             // TXT silently dropped). Idempotent so a link flap / W5500 recovery re-registers cleanly.
@@ -281,6 +354,18 @@ namespace OpenKNX
             void forgetOpenknxMdns(); // the interface (and its services) goes away: the next registration starts fresh
             bool _mdnsWasEstablished = false; // rising edge for the re-registration in checkLinkStatus()
 #endif
+#if defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+            // W5500-on-ESP hard-wedge recovery (link-based: esp_eth owns the SPI bus, we cannot raw-read VERSIONR).
+            void checkEthHealthEsp();
+            uint32_t _lastEthDownEsp = 0;       // millis() the link first went down (0 = up/established)
+            uint32_t _lastEthHealEsp = 0;       // throttle between recovery attempts
+            bool _ethWasEstablishedEsp = false; // sticky: a real link+IP came up at least once this session
+            uint8_t _ethHealBackoffStep = 0;    // exponential backoff index for recovery attempts
+            static constexpr uint32_t ETH_ESP_WEDGE_MS = 30000;
+            static constexpr uint32_t ETH_ESP_HEAL_INTERVAL_MS = 30000;
+            static constexpr uint32_t ETH_ESP_HEAL_INTERVAL_MAX_MS = 120000;
+#endif
+
 #if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
             // Feed PHY link edges to lwIP; arduino-pico's W5500 driver doesn't, leaving DHCP on a stale lease.
             void setLwipLinkState(bool up);
@@ -305,6 +390,14 @@ namespace OpenKNX
             void checkKnxIpStatus(); // drives the KNX-IP-Status LED (func 11): green=KNXnet/IP running, orange=link up but KNX-IP down, red=no link
             void checkKnxIpDeviceState(bool established); // feeds the IP-fault bit of PID_KNXNETIP_DEVICE_STATE
             bool knxIpEnabled();     // is the KNXnet/IP datalink layer currently enabled?
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+            void processAfterStartupDelay() override; // EthLinkManager re-applies the persisted fixed link mode
+#endif
+            // Module-flash persistence. writeFlash()/readFlash() chain the EthLink fixed-mode bytes first
+            // (RP2040+W5500 only), then the local-override block (DEVICE_DISPLAY only). size==0 -> defaults.
+            uint16_t flashSize() override;
+            void writeFlash() override;
+            void readFlash(const uint8_t *data, const uint16_t size) override;
 
 #ifdef OPENKNX_PING
             OpenKNX::Network::Ping::Handler _pingHandler;
