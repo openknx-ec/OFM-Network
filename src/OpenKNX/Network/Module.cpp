@@ -7,6 +7,7 @@
 #include "DNS.h"
 #include "Module.h"
 
+// Periodic IGMP re-report; the call differs per platform (see Module::refreshMulticastMembership).
 #if defined(KNX_IP_LAN) || defined(KNX_IP_WIFI)
     #include <lwip/igmp.h>
     #include <lwip/netif.h>
@@ -1040,6 +1041,68 @@ namespace OpenKNX
                 SetByteProperty(PID_KNXNETIP_DEVICE_STATE, next);
         }
 
+        /**
+         * @brief Re-report the multicast membership so a snooping switch without a querier keeps the port.
+         * Reports, never re-joins: a Leave is what prunes the group. linkEstablished is the caller's
+         * already-debounced carrier state.
+         */
+        void Module::refreshMulticastMembership(bool linkEstablished)
+        {
+#if !defined(KNX_IP_LAN) && !defined(KNX_IP_WIFI)
+            (void)linkEstablished;
+            return;
+#else
+            if (NET_IGMP_REPORT_MS == 0) return; // switched off for this product
+
+            if (!linkEstablished)
+            {
+                // ESP32 frees the group list on link down, so a report right after link-up finds nothing.
+                _lastIgmpReport = millis();
+                return;
+            }
+            if (!delayCheckMillis(_lastIgmpReport, NET_IGMP_REPORT_MS)) return;
+
+            // Stamp only where the report was handed over: up front, a dropped dispatch costs an interval.
+#if defined(ARDUINO_ARCH_RP2040)
+#ifdef KNX_IP_LAN
+            netif *intf = KNX_NETIF.getNetIf();
+#else
+            // WiFi client: no netif accessor, the interface is the one with the client address. An own AP is
+            // the network itself, no snooping switch in between.
+            if (wifiApActive()) return;
+            netif *intf = nullptr;
+            const uint32_t ip = (uint32_t)KNX_NETIF.localIP();
+            for (netif *n = netif_list; n != nullptr && ip != 0; n = n->next)
+                if (ip4_addr_get_u32(netif_ip4_addr(n)) == ip)
+                {
+                    intf = n;
+                    break;
+                }
+#endif
+            if (intf == nullptr) return;
+            igmp_report_groups(intf); // core-wrapped, takes the lwIP lock itself
+            _lastIgmpReport = millis();
+#elif defined(ARDUINO_ARCH_ESP32)
+            // Only the netif index is public; resolving it inside the callback keeps both lwIP calls in
+            // the tcpip task. num is recycled, so a stray report on another netif is possible.
+#ifdef KNX_IP_LAN
+            const int idx = esp_netif_get_netif_impl_index(KNX_NETIF.netif());
+#else
+            if (wifiApActive()) return; // own AP: the network itself, no snooping switch in between
+            const int idx = esp_netif_get_netif_impl_index(WiFi.STA.netif());
+#endif
+            if (idx <= 0) return;
+            // try_, not tcpip_callback(): that one blocks this task until the tcpip mailbox drains.
+            const err_t posted = tcpip_try_callback([](void *arg) {
+                netif *n = netif_get_by_index((u8_t)(uintptr_t)arg);
+                if (n != nullptr) igmp_report_groups(n);
+            }, (void *)(uintptr_t)idx);
+            if (posted != ERR_OK) return; // queue or msg pool exhausted: keep the throttle armed, retry next tick
+            _lastIgmpReport = millis();
+#endif
+#endif
+        }
+
         void Module::checkLinkStatus()
         {
             if (!delayCheckMillis(_lastLinkCheck, 500)) return;
@@ -1059,6 +1122,7 @@ namespace OpenKNX
             // address but no KNXnet/IP endpoint is exactly that, so it has to feed this too.
             checkKnxIpDeviceState(establishedState && knxIpEnabled());
 
+            refreshMulticastMembership(establishedState); // reuses this tick's debounced state
 
 #ifdef ARDUINO_ARCH_ESP32
             // Level-triggered: follows the link state every tick, so a failing join is retried every 500 ms.

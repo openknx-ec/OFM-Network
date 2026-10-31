@@ -17,11 +17,18 @@ namespace OpenKNX
 
             openknx.common.skipLooptimeWarning(); // Parsen kann bei grosser Tabelle länger dauern
 
-            File file = LittleFS.open("/openknx_ga.tsv", "r");
-            if (!file)
+            // Ask first: the ESP32 VFS logs a missing file at ERROR level, which reads like a fault.
+            if (!LittleFS.exists("/openknx_ga.tsv"))
             {
                 logInfo("GATable", "no /openknx_ga.tsv found, 0 entries");
                 return; // keine Tabelle → getDpt() liefert immer false
+            }
+
+            File file = LittleFS.open("/openknx_ga.tsv", "r");
+            if (!file)
+            {
+                logInfo("GATable", "/openknx_ga.tsv not readable, 0 entries");
+                return;
             }
 
             // Zeilenweise on-the-fly parsen: nur die ersten drei Felder
