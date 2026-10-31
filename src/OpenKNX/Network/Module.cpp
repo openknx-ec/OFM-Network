@@ -584,6 +584,9 @@ namespace OpenKNX
             ArduinoOTA.setRebootOnSuccess(false);
             ArduinoOTA.onStart([&]() {
                 _otaActive = true; // display OTA overlay takes over (SYSTEM priority)
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+                phyToolAbort(); // loop() returns before the state machine while OTA runs
+#endif
                 if (ArduinoOTA.getCommand() == U_FLASH)
                     logInfo("OTA", "Start updating firmware");
                 else // U_SPIFFS
@@ -1084,6 +1087,11 @@ namespace OpenKNX
             // lwIP lock in the windows between flash commits. The device is dedicated to the update anyway.
             if (_otaActive) return;
 #if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+            if (phyToolActive())
+            {
+                phyToolLoop(); // 'net phy reset|pin' owns RSTn and the SPI bus until it is done
+                return;
+            }
             if (_ethDegraded)
             {
                 ethSelfHeal(); // W5500 not up yet: keep retrying a clean bring-up; skip normal link handling
@@ -1293,6 +1301,63 @@ namespace OpenKNX
                 showNetworkHelp();
                 return true;
             }
+
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN) && defined(OPENKNX_CONSOLE_DEV)
+            // 'net phy [ver|reset [ms]|pin [s]]' -- W5500 SPI/RSTn diagnostics (developer console).
+            else if (cmd == "net phy" || cmd.compare(0, 8, "net phy ") == 0)
+            {
+                std::string arg = (cmd.length() > 8) ? cmd.substr(8) : "";
+                while (!arg.empty() && arg[0] == ' ')
+                    arg.erase(0, 1);
+
+                // Before the no-arg branch: showPhyStatus() reads SPI and would misreport during a toggle.
+                if (phyToolActive())
+                {
+                    logErrorP("net phy: a diagnostic is still running");
+                    return true;
+                }
+                if (arg.empty())
+                {
+                    showPhyStatus();
+                    return true;
+                }
+
+                std::string sub = arg, param;
+                size_t sp = arg.find(' ');
+                if (sp != std::string::npos)
+                {
+                    sub = arg.substr(0, sp);
+                    param = arg.substr(sp + 1);
+                }
+                // Clamp on the long: casting first would wrap a huge argument into a small legal value.
+                long value = param.empty() ? 0 : atol(param.c_str());
+                if (value < 0) value = 0;
+                if (value > 0xFFFF) value = 0xFFFF;
+
+                // loop() returns before phyToolLoop() while either flag is set: RSTn would stay driven.
+                if ((sub == "reset" || sub == "pin") && (_otaActive || _powerSave))
+                {
+                    logErrorP("net phy: refused while %s is active", _otaActive ? "OTA" : "power save");
+                    return true;
+                }
+
+                if (sub == "ver")
+                    logInfoP("VERSIONR: 0x%02X at 1 MHz (expected 0x04)", readVersionLocked(1000000));
+                else if (sub == "reset")
+                    phyToolStartReset((uint16_t)value);
+                else if (sub == "pin")
+                    phyToolStartPin((uint16_t)value);
+                else
+                    logErrorP("net phy [ver|reset [ms]|pin [s]]");
+                return true;
+            }
+#elif defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_CONSOLE_DEV)
+            else if (cmd == "net phy" || cmd.compare(0, 8, "net phy ") == 0)
+            {
+                logErrorP("net phy: not available on ESP32 -- esp_eth owns the W5500 SPI bus");
+                return true;
+            }
+#endif
 
 #if MASK_VERSION == 0x091A || MASK_VERSION == 0x57B0
             else if (cmd == "net mc")
@@ -1601,6 +1666,14 @@ namespace OpenKNX
             openknx.console.printHelpLine("net eth 10 [half|full]", "Force a fixed 10 Mbit link (default half)");
             openknx.console.printHelpLine("net eth 100 [half|full]", "Force a fixed 100 Mbit link (default half)");
 #endif
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN) && defined(OPENKNX_CONSOLE_DEV)
+            openknx.console.printHelpLine("net phy", "W5500 status: VERSIONR, PHYCFGR, RSTn pin, SPI clock");
+            openknx.console.printHelpLine("net phy ver", "Read VERSIONR at 1 MHz (rules out SPI signal quality)");
+            openknx.console.printHelpLine("net phy reset [ms]", "Pulse RSTn (default 100ms) and report VERSIONR before/after");
+            openknx.console.printHelpLine("net phy pin [s]", "Toggle RSTn at 1 Hz (default 30s) to measure at the chip");
+#elif defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_ETH_W5500) && defined(OPENKNX_CONSOLE_DEV)
+            openknx.console.printHelpLine("net phy", "W5500 status (not available on ESP32: esp_eth owns the SPI bus)");
+#endif
         }
 
         // Link status
@@ -1673,6 +1746,9 @@ namespace OpenKNX
 
         void Module::savePower()
         {
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+            phyToolAbort(); // loop() stops here from now on
+#endif
             _powerSave = true;
 #if defined(PIN_ETH_RES)
             digitalWrite(PIN_ETH_RES, LOW);
@@ -2167,6 +2243,19 @@ namespace OpenKNX
             _healStep = HealStep::Wait;
             _ethDegraded = true; // loop() -> ethSelfHeal(): bounded re-begin
         }
+
+        // ---- console PHY diagnostics ('net phy ...') --------------------------------------------------
+
+        // VERSIONR under the driver's lwIP lock, at a caller-chosen clock. Same locking as checkEthHealth():
+        // without it the read interleaves with the SPI pump and a healthy chip reads back as garbage.
+        uint8_t Module::readVersionLocked(uint32_t hz)
+        {
+            ethernet_arch_lwip_begin();
+            const uint8_t ver = _ethLink.phy().chipVersion(hz);
+            ethernet_arch_lwip_end();
+            return ver;
+        }
+
         // Socket 0 status under the lwIP lock. Same locking as the VERSIONR probe.
         uint8_t Module::readSocketStatusLocked()
         {
@@ -2176,6 +2265,151 @@ namespace OpenKNX
             return sr;
         }
 
+        // 'net phy': everything that can be asked without disturbing the link.
+        void Module::showPhyStatus()
+        {
+            constexpr uint8_t BLOCK_COMMON = 0x00;
+            constexpr uint16_t REG_PHYCFGR = 0x002E;
+
+            const uint8_t ver = readVersionLocked(0);
+            ethernet_arch_lwip_begin();
+            const uint8_t phycfgr = _ethLink.phy().readReg(BLOCK_COMMON, REG_PHYCFGR);
+            ethernet_arch_lwip_end();
+
+            logInfoP("VERSIONR: 0x%02X (%s)", ver, ver == 0x04 ? "W5500 present" : "no answer on SPI");
+            if (ver == 0x04)
+                logInfoP("PHYCFGR: 0x%02X (link %s, %s Mbit, %s-duplex)", phycfgr,
+                         (phycfgr & 0x01) ? "up" : "down", (phycfgr & 0x02) ? "100" : "10",
+                         (phycfgr & 0x04) ? "full" : "half");
+            else // decoding a register read off a silent chip would print an invented link state
+                logInfoP("PHYCFGR: 0x%02X (raw - chip silent, do not read a link state into this)", phycfgr);
+#if defined(PIN_ETH_RES)
+            logInfoP("RSTn: GPIO%d", (int)PIN_ETH_RES);
+#else
+            logInfoP("RSTn: not wired on this board");
+#endif
+            logInfoP("SPI: %lu Hz driver (probes use the same)", (unsigned long)_ethLink.phy().driverClock());
+            if (ver == 0x04)
+            {
+                const uint8_t sr = readSocketStatusLocked();
+                logInfoP("Sn_SR: 0x%02X (%s)", sr, sr == W5500_SOCK_MACRAW ? "socket 0 in MACRAW" : "socket not open");
+            }
+            // checkEthHealth() does not run while degraded, so _ethBadProbes stays 0 there.
+            if (_ethDegraded)
+                logInfoP("State: degraded, %u failed bring-ups", (unsigned)_healFailures);
+            else
+                logInfoP("State: up, %u consecutive bad probes", (unsigned)_ethBadProbes);
+        }
+
+        // 'net phy reset [ms]': RSTn low for ms, settle, then VERSIONR before/after. Detaches the stack
+        // first so nothing drives SPI into a chip that is held in reset.
+        void Module::phyToolStartReset(uint16_t lowMs)
+        {
+#if defined(PIN_ETH_RES)
+            if (lowMs == 0) lowMs = PHY_TOOL_RESET_MS_DEFAULT;
+            if (lowMs > PHY_TOOL_RESET_MS_MAX) lowMs = PHY_TOOL_RESET_MS_MAX;
+
+            _phyToolVerBefore = readVersionLocked(0);
+            _phyToolLowMs = lowMs;
+            logInfoP("PHY reset: VERSIONR before 0x%02X, RSTn low %ums -- the network drops now",
+                     _phyToolVerBefore, (unsigned)lowMs);
+
+            recoverEth(); // detach KNX-IP + driver, sets _ethDegraded: loop() hands us the bus
+            pinMode(PIN_ETH_RES, OUTPUT);
+            digitalWrite(PIN_ETH_RES, LOW);
+            _phyToolAt = millis() + lowMs;
+            _phyTool = PhyTool::ResetLow;
+#else
+            logErrorP("PHY reset: no RSTn pin on this board");
+#endif
+        }
+
+        // 'net phy pin [s]': 1 Hz square wave on RSTn so a multimeter at the chip pin can prove the pulse
+        // arrives. The chip is useless while this runs -- that is the point.
+        void Module::phyToolStartPin(uint16_t seconds)
+        {
+#if defined(PIN_ETH_RES)
+            if (seconds == 0) seconds = PHY_TOOL_PIN_S_DEFAULT;
+            if (seconds > PHY_TOOL_PIN_S_MAX) seconds = PHY_TOOL_PIN_S_MAX;
+
+            logInfoP("PHY pin: toggling GPIO%d at 1 Hz for %us -- measure at the W5500 RSTn pin",
+                     (int)PIN_ETH_RES, (unsigned)seconds);
+
+            recoverEth();
+            pinMode(PIN_ETH_RES, OUTPUT);
+            digitalWrite(PIN_ETH_RES, HIGH);
+            _phyToolLevel = true;
+            _phyToolAt = millis();                       // first edge on the next loop pass
+            _phyToolEnd = millis() + (uint32_t)seconds * 1000;
+            _phyTool = PhyTool::PinToggle;
+#else
+            logErrorP("PHY pin: no RSTn pin on this board");
+#endif
+        }
+
+        // Give up a running diagnostic and hand back to the self-heal. loop() stops servicing the state
+        // machine while _powerSave / _otaActive are set; without this the tool would stay "active" forever
+        // and silently disable the W5500 watchdog for the rest of the session.
+        void Module::phyToolAbort()
+        {
+            if (_phyTool == PhyTool::None) return;
+#if defined(PIN_ETH_RES)
+            digitalWrite(PIN_ETH_RES, HIGH);
+#endif
+            _phyTool = PhyTool::None;
+            _lastEthHeal = 0;
+            logInfoP("PHY diagnostic aborted");
+        }
+
+        // loop() while a diagnostic runs. One step per pass, never a delay(); self-heal and the health
+        // probe are skipped by the caller so nothing else touches RSTn or SPI meanwhile.
+        void Module::phyToolLoop()
+        {
+#if defined(PIN_ETH_RES)
+            const uint32_t now = millis();
+            if ((int32_t)(now - _phyToolAt) < 0) return; // step not due yet (wrap-safe)
+
+            switch (_phyTool)
+            {
+                case PhyTool::ResetLow:
+                    digitalWrite(PIN_ETH_RES, HIGH);
+                    _phyToolAt = now + PHY_TOOL_SETTLE_MS;
+                    _phyTool = PhyTool::ResetSettle;
+                    break;
+
+                case PhyTool::ResetSettle:
+                {
+                    const uint8_t after = readVersionLocked(0);
+                    logInfoP("PHY reset: VERSIONR 0x%02X -> 0x%02X after %ums low + %ums settle (%s)",
+                             _phyToolVerBefore, after, (unsigned)_phyToolLowMs, (unsigned)PHY_TOOL_SETTLE_MS,
+                             after == 0x04 ? "chip answers" : "chip still silent");
+                    _phyTool = PhyTool::None;
+                    _lastEthHeal = 0; // self-heal picks up on the next pass
+                    break;
+                }
+
+                case PhyTool::PinToggle:
+                    if ((int32_t)(now - _phyToolEnd) >= 0)
+                    {
+                        digitalWrite(PIN_ETH_RES, HIGH);
+                        logInfoP("PHY pin: toggle window over, RSTn released");
+                        _phyTool = PhyTool::None;
+                        _lastEthHeal = 0;
+                        break;
+                    }
+                    _phyToolLevel = !_phyToolLevel;
+                    digitalWrite(PIN_ETH_RES, _phyToolLevel ? HIGH : LOW);
+                    _phyToolAt = now + 500; // 1 Hz = 500 ms per level
+                    break;
+
+                default:
+                    _phyTool = PhyTool::None;
+                    break;
+            }
+#else
+            _phyTool = PhyTool::None;
+#endif
+        }
 #endif
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
