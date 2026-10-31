@@ -42,6 +42,7 @@
 #elif defined(ARDUINO_ARCH_RP2040)
 #include <SimpleMDNS.h>
 
+#include <lwip/apps/mdns.h> // RP2040 mDNS via the lwIP API directly (SimpleMDNS.addServiceTxt broken on arduino-pico)
 #include <lwip/netif.h>
 #if defined(KNX_IP_LAN)
 #include "W5500lwIP.h"
@@ -55,10 +56,43 @@ Wiznet5500lwIP KNX_NETIF(PIN_ETH_SS, ETH_SPI_INTERFACE);
 #pragma warn "Missing KNX_IP_LAN or KNX_IP_WIFI"
 #endif
 
+// Board identity for the mDNS TXT record, same fallback order the console uses for "Device / Name".
+#if defined(DEVICE_NAME)
+    #define OPENKNX_MDNS_HARDWARE DEVICE_NAME
+#elif defined(HARDWARE_NAME)
+    #define OPENKNX_MDNS_HARDWARE HARDWARE_NAME
+#endif
+
+// mDNS TXT state (file scope so the lwIP announce callback can read it). Idempotent re-registration keeps
+// slot+netif to del-before-add. See Module::registerOpenknxMdns().
+// 64, not 48: "hardware=" plus a board name (DEVICE_NAME runs to ~45 chars) does not fit 48 and would
+// be truncated silently. Item cap is the DNS limit of 255 B, so 64 is free to choose.
+static char _openknxMdnsTxt[10][64]; // "key=value", <= 255 B per DNS TXT item
+static uint8_t _openknxMdnsTxtCount = 0;
+static s8_t _openknxMdnsSlot = -1;
+static struct netif *_openknxMdnsNetif = nullptr;
+static void _openknxMdnsTxtCb(struct mdns_service *service, void *txt_userdata)
+{
+    (void)txt_userdata;
+    for (uint8_t i = 0; i < _openknxMdnsTxtCount; i++)
+        mdns_resp_add_service_txtitem(service, _openknxMdnsTxt[i], (u8_t)strlen(_openknxMdnsTxt[i]));
+}
+
 WiFiUDP Udp;
 #else
 #pragma warn "Unsupported platform"
 #endif
+
+// mDNS "otamode" TXT value from the ETS OTA-Update setting (ParamNET_OTAUpdate): prog | always | off.
+// An unconfigured device has no ETS params -> reports "always" (mirrors handleOTA). File scope so both the
+// ESP (ESPmDNS) and RP2040 (lwIP) mDNS paths read it.
+static const char *otaModeStr()
+{
+    if (!knx.configured()) return "always";
+    if (ParamNET_OTAUpdate == 2) return "off";
+    if (ParamNET_OTAUpdate == 0) return "prog";
+    return "always";
+}
 
 namespace OpenKNX
 {
@@ -93,6 +127,9 @@ namespace OpenKNX
             KNX_NETIF.disconnect(true, true);
             KNX_NETIF.mode(WIFI_OFF);
 #else
+#ifdef ARDUINO_ARCH_RP2040
+            forgetOpenknxMdns(); // end() removes the interface and its services
+#endif
             KNX_NETIF.end();
 #endif
             delay(500);
@@ -399,14 +436,18 @@ namespace OpenKNX
                 MDNS.addServiceTxt("openknx", "tcp", "address", openknx.info.humanIndividualAddress().c_str());
                 MDNS.addServiceTxt("openknx", "tcp", "ota", _otaPortString);
                 MDNS.addServiceTxt("openknx", "tcp", "configured", knx.configured() ? "1" : "0");
+                MDNS.addServiceTxt("openknx", "tcp", "otamode", otaModeStr());
+                // Which application, and on which board -- lets a scanner name the device and warn before
+                // a wrong image is pushed over the network.
+                MDNS.addServiceTxt("openknx", "tcp", "product", openknx.info.firmwareName().c_str());
+                // The KNX order number (PID_ORDER_INFO, what ETS shows) is the stable identity: the
+                // display name carries a build suffix, this one does not. Tools compare on THIS.
+                MDNS.addServiceTxt("openknx", "tcp", "order", MAIN_OrderNumber);
+#ifdef OPENKNX_MDNS_HARDWARE
+                MDNS.addServiceTxt("openknx", "tcp", "hardware", OPENKNX_MDNS_HARDWARE);
+#endif
 #else
-                hMDNSService service = MDNS.addService("openknx", "tcp", -1);
-                MDNS.addServiceTxt(service, "serial", openknx.info.humanSerialNumber().c_str());
-                MDNS.addServiceTxt(service, "version", openknx.info.humanFirmwareVersion().c_str());
-                MDNS.addServiceTxt(service, "firmware", openknx.info.humanFirmwareNumber().c_str());
-                MDNS.addServiceTxt(service, "address", openknx.info.humanIndividualAddress().c_str());
-                MDNS.addServiceTxt(service, "ota", _otaPortString);
-                MDNS.addServiceTxt(service, "configured", (uint8_t)knx.configured());
+                registerOpenknxMdns(); // RP2040: register via lwIP (SimpleMDNS.addServiceTxt broken); reused by checkLinkStatus()
 #endif
                 MDNS.enableArduino(_otaPort /* default port for ota */, false /* AUTH true / false */);
             }
@@ -732,6 +773,11 @@ namespace OpenKNX
 
             const bool newLinkState = establishedState || carrier;
 
+#if defined(ARDUINO_ARCH_RP2040)
+            // re-register mDNS on the link-up edge (the service is lost with the old netif on a W5500 recovery)
+            if (establishedState && !_mdnsWasEstablished) registerOpenknxMdns();
+            _mdnsWasEstablished = establishedState;
+#endif
             if (newLinkState && establishedState)
             {
                 if (_ipLedState != 1)
@@ -1583,6 +1629,66 @@ namespace OpenKNX
             return false;
 #endif
         }
+#if defined(ARDUINO_ARCH_RP2040)
+        // (Re)register the _openknx mDNS service + TXT via lwIP. Idempotent (del-before-add) so a link flap or
+        // W5500 recovery re-registers cleanly. Called from setup() and the link-up edge in checkLinkStatus().
+        void Module::forgetOpenknxMdns()
+        {
+            _openknxMdnsSlot = -1;
+            _openknxMdnsNetif = nullptr;
+            _mdnsWasEstablished = false;
+        }
+
+        void Module::registerOpenknxMdns()
+        {
+            if (!(!knx.configured() || ParamNET_mDNS)) return; // mDNS disabled
+#ifdef KNX_IP_WIFI
+            LWIPMutex m; // lwIP runs in the async context on WiFi
+#endif
+
+            // remove the previous registration if its netif still exists (skip after a recovery -> old netif gone)
+            if (_openknxMdnsNetif != nullptr && _openknxMdnsSlot >= 0)
+                for (struct netif *n = netif_list; n != nullptr; n = n->next)
+                    if (n == _openknxMdnsNetif)
+                    {
+                        mdns_resp_del_service(_openknxMdnsNetif, (u8_t)_openknxMdnsSlot);
+                        break;
+                    }
+            _openknxMdnsSlot = -1;
+            _openknxMdnsNetif = nullptr;
+
+            // rebuild TXT each time -- address/configured can change across a reprogram
+            snprintf(_openknxMdnsTxt[0], sizeof(_openknxMdnsTxt[0]), "serial=%s", openknx.info.humanSerialNumber().c_str());
+            snprintf(_openknxMdnsTxt[1], sizeof(_openknxMdnsTxt[1]), "version=%s", openknx.info.humanFirmwareVersion().c_str());
+            snprintf(_openknxMdnsTxt[2], sizeof(_openknxMdnsTxt[2]), "firmware=%s", openknx.info.humanFirmwareNumber().c_str());
+            snprintf(_openknxMdnsTxt[3], sizeof(_openknxMdnsTxt[3]), "address=%s", openknx.info.humanIndividualAddress().c_str());
+            snprintf(_openknxMdnsTxt[4], sizeof(_openknxMdnsTxt[4]), "ota=%s", _otaPortString);
+            snprintf(_openknxMdnsTxt[5], sizeof(_openknxMdnsTxt[5]), "configured=%u", knx.configured() ? 1u : 0u);
+            snprintf(_openknxMdnsTxt[6], sizeof(_openknxMdnsTxt[6]), "otamode=%s", otaModeStr());
+            snprintf(_openknxMdnsTxt[7], sizeof(_openknxMdnsTxt[7]), "product=%s", openknx.info.firmwareName().c_str());
+            snprintf(_openknxMdnsTxt[8], sizeof(_openknxMdnsTxt[8]), "order=%s", MAIN_OrderNumber);
+            _openknxMdnsTxtCount = 9;
+#ifdef OPENKNX_MDNS_HARDWARE
+            snprintf(_openknxMdnsTxt[9], sizeof(_openknxMdnsTxt[9]), "hardware=%s", OPENKNX_MDNS_HARDWARE);
+            _openknxMdnsTxtCount = 10;
+#endif
+
+            struct netif *n = netif_default ? netif_default : netif_list; // active iface (DHCP default; first at boot)
+            if (n != nullptr)
+            {
+                s8_t slot = mdns_resp_add_service(n, _hostName, "_openknx", DNSSD_PROTO_TCP, 65535, _openknxMdnsTxtCb, nullptr);
+                if (slot >= 0)
+                {
+                    _openknxMdnsSlot = slot;
+                    _openknxMdnsNetif = n;
+                    mdns_resp_announce(n);
+                }
+                else
+                    logErrorP("mDNS: _openknx add_service failed (%d)", (int)slot);
+            }
+        }
+#endif
+
 
 #ifdef OPENKNX_PING
         void Module::ping(IPAddress target, std::function<void(IPAddress, bool, uint32_t)> callback, uint32_t timeoutMs)

@@ -266,6 +266,13 @@ namespace OpenKNX
             uint32_t _lastLinkUptimeSec = 0;   // how long the link had been up when it last went down
             uint16_t _reconnects = 0;          // link-up edges after the first one
             bool _linkEverDown = false;        // the first link-up is a connect, not a reconnect
+#if defined(ARDUINO_ARCH_RP2040)
+            // RP2040 mDNS via the lwIP API directly (SimpleMDNS.addServiceTxt is broken on arduino-pico ->
+            // TXT silently dropped). Idempotent so a link flap / W5500 recovery re-registers cleanly.
+            void registerOpenknxMdns();
+            void forgetOpenknxMdns(); // the interface (and its services) goes away: the next registration starts fresh
+            bool _mdnsWasEstablished = false; // rising edge for the re-registration in checkLinkStatus()
+#endif
 #if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
             // Feed PHY link edges to lwIP; arduino-pico's W5500 driver doesn't, leaving DHCP on a stale lease.
             void setLwipLinkState(bool up);
