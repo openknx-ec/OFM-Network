@@ -422,6 +422,7 @@ namespace OpenKNX
             registerCallback([this](bool state) { if (state) this->showNetworkInformations(false); });
 
             _ipLedFunc = openknx.ledFunctions.get(OPENKNX_LEDFUNC_NET_STATE);
+            _knxIpLedFunc = openknx.ledFunctions.get(OPENKNX_LEDFUNC_KNXIP_STATE);
 
             if (!configured || ParamNET_mDNS)
             {
@@ -747,6 +748,9 @@ namespace OpenKNX
         void Module::checkLinkStatus()
         {
             if (!delayCheckMillis(_lastLinkCheck, 500)) return;
+            // KNX-IP-Status LED (func 11): reflects the KNXnet/IP datalink, separate from the physical-link LED below.
+            checkKnxIpStatus();
+
             // One carrier read per tick, debounced where it can glitch; everything below derives from it
             // instead of re-reading PHYCFGR, so a single garbled read cannot flip half the tick's decisions.
             const bool carrier = linkCarrier();
@@ -1629,6 +1633,45 @@ namespace OpenKNX
             return false;
 #endif
         }
+
+        // KNX-IP-Status LED (func 11): reflects the KNXnet/IP datalink, not just the physical link.
+        //   GREEN  = KNXnet/IP datalink really running
+        //   ORANGE = link + IP up, but KNXnet/IP NOT running ("looks connected, KNX-IP dead")
+        //   RED    = no link / no IP
+        void Module::checkKnxIpStatus()
+        {
+            if (_knxIpLedFunc == nullptr || !_knxIpLedFunc->active()) return;
+
+            uint8_t newState; // 1 = green, 2 = orange, 3 = red
+            if (knxIpEnabled() && established())
+                newState = 1; // KNXnet/IP running AND link/IP up
+            else if (established())
+                newState = 2; // link/IP up, but KNX-IP not running (router; on 0x07B0 while the setup AP has closed the endpoint, or until networkChanged() opens it)
+            else
+                newState = 3; // no link / no IP (on 0x07B0 this is the "network down" state)
+
+            if (_knxIpLedState == newState) return;
+            _knxIpLedState = newState;
+
+            switch (newState)
+            {
+                case 1: // KNXnet/IP running
+                    _knxIpLedFunc->color(OpenKNX::Led::Color::Green);
+                    _knxIpLedFunc->activity(OpenKNX::Led::g_ipLedActivity, true);
+                    break;
+                case 2: // network up, KNX-IP not running
+                    _knxIpLedFunc->color(OpenKNX::Led::Color::Orange);
+                    _knxIpLedFunc->on(OpenKNX::Led::Capability::COLOR);
+                    _knxIpLedFunc->blinking(1000, OpenKNX::Led::Capability::MONOCHROME);
+                    break;
+                default: // 3: no link / no IP
+                    _knxIpLedFunc->color(OpenKNX::Led::Color::Red);
+                    _knxIpLedFunc->on(OpenKNX::Led::Capability::COLOR);
+                    _knxIpLedFunc->off(OpenKNX::Led::Capability::MONOCHROME);
+                    break;
+            }
+        }
+
 #if defined(ARDUINO_ARCH_RP2040)
         // (Re)register the _openknx mDNS service + TXT via lwIP. Idempotent (del-before-add) so a link flap or
         // W5500 recovery re-registers cleanly. Called from setup() and the link-up edge in checkLinkStatus().
