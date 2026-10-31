@@ -33,6 +33,7 @@
 #elif defined(ARDUINO_ARCH_RP2040)
 #include <SimpleMDNS.h>
 
+#include <lwip/netif.h>
 #if defined(KNX_IP_LAN)
 #include "W5500lwIP.h"
 #ifdef PIN_ETH_INT
@@ -74,6 +75,9 @@ namespace OpenKNX
         {
             logInfoP("Reset network adapter");
             logIndentUp();
+            _ipShown = false; // let checkIpStatus() rebuild the KNXnet/IP endpoint after the bounce
+            _ipStableSince = 0;
+
             controlKnxIp(false);
 
 #if defined(KNX_IP_WIFI) && defined(ARDUINO_ARCH_ESP32)
@@ -173,8 +177,9 @@ namespace OpenKNX
                     uint8_t friendlyNameWrite[30] = {};
                     memcpy(friendlyNameWrite, _hostName, strlen(_hostName));
                     elements = 30;
-                    length = 0; // will update by write
-                    knx.bau().propertyValueWrite(OT_IP_PARAMETER, 0, PID_FRIENDLY_NAME, elements, 1, friendlyNameWrite, 0);
+                    // length is an INPUT here: the bau discards the write if it is shorter than elements * ElementSize().
+                    length = sizeof(friendlyNameWrite);
+                    knx.bau().propertyValueWrite(OT_IP_PARAMETER, 0, PID_FRIENDLY_NAME, elements, 1, friendlyNameWrite, length);
                 }
 
                 delete[] friendlyNameRead; // propertyValueRead() allocates the buffer, we have to free it
@@ -410,12 +415,14 @@ namespace OpenKNX
             ArduinoOTA.setPort(_otaPort);
             ArduinoOTA.setRebootOnSuccess(false);
             ArduinoOTA.onStart([&]() {
+                _otaActive = true; // display OTA overlay takes over (SYSTEM priority)
                 if (ArduinoOTA.getCommand() == U_FLASH)
                     logInfo("OTA", "Start updating firmware");
                 else // U_SPIFFS
                     logInfo("OTA", "Start updating filesystem");
             });
             ArduinoOTA.onEnd([&]() {
+                _otaActive = false;
                 logIndentUp();
                 logInfo("OTA", "Update complete");
                 logIndentDown();
@@ -433,6 +440,7 @@ namespace OpenKNX
                 openknx.loop();
             });
             ArduinoOTA.onError([&](ota_error_t error) {
+                _otaActive = false; // release the display overlay so normal operation resumes
                 logIndentUp();
                 if (error == OTA_AUTH_ERROR)
                     logError("OTA", "Auth error");
@@ -530,9 +538,98 @@ namespace OpenKNX
 #endif
 #endif
 
+        // Establish debounce: only print "Network established" + fire the establish callbacks once the link has
+        // genuinely held this long, not on every brief establish during the ETH auto-fallback search / flapping.
+        static constexpr uint32_t NET_INFO_STABLE_MS = 3000;
+
+        // Carrier for the link edge logic. On RP2040 + W5500 the read is a PHYCFGR fetch over the SPI bus the
+        // driver shares, so a garbled read has to be absorbed. It is debounced DOWNWARDS ONLY: a corrupt read
+        // shows up as "not linked", which is what must not drop DHCP, while a read that says "linked" cannot
+        // be that kind of glitch. Debouncing both directions kept the accepted state at its initial false for
+        // good on a link that flaps faster than the window, and the fallback ladder, which only acts on carrier
+        // edges, then never saw one. Everywhere else the platform reports the link from an event.
+        bool Module::linkCarrier()
+        {
+            const bool raw = connected();
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+            if (raw)
+            {
+                _carrierSamples = 0;
+                _carrierStable = true;
+                return true;
+            }
+            if (!_carrierStable)
+            {
+                _carrierSamples = 0;
+                return false;
+            }
+            if (++_carrierSamples < LINK_DEBOUNCE_SAMPLES) return true; // still counted as up while in doubt
+            _carrierSamples = 0;
+            _carrierStable = false;
+            return false;
+#else
+            return raw;
+#endif
+        }
+
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
+        // arduino-pico's W5500 driver never calls netif_set_link_up/down, so lwIP misses cable changes and
+        // DHCP stays on the stale lease. Feed both edges so dhcp_discover() re-runs and DHCP/AutoIP re-arm.
+
+        void Module::setLwipLinkState(bool up)
+        {
+            netif *intf = KNX_NETIF.getNetIf();
+            if (intf == nullptr) return;
+
+            ethernet_arch_lwip_begin();
+            if (up)
+                netif_set_link_up(intf);
+            else
+                netif_set_link_down(intf);
+            ethernet_arch_lwip_end();
+        }
+#endif
+
+
+        // Link-down housekeeping. Also called by the W5500 recovery, which bypasses checkLinkStatus() and
+        // would otherwise leave lwIP's link-up flag set and the DHCP/AutoIP handover unarmed.
+        void Module::onLinkLost()
+        {
+            // idempotent: both the down edge and recoverEth() call it; running twice would restart the outage timer.
+            if (!_currentLinkState) return;
+
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
+            setLwipLinkState(false); // must run while the netif still exists (before any end())
+#endif
+            _currentLinkState = false;
+            _ipShown = false;
+            _ipStableSince = 0; // restart the establish debounce on link loss
+            _linkDownSinceSec = uptime();
+            _lastLinkUptimeSec = _linkUpSinceSec ? (_linkDownSinceSec - _linkUpSinceSec) : 0;
+            _linkUpSinceSec = 0;
+            _establishedSinceSec = 0;
+            _linkEverDown = true;
+            loadCallbacks(false);
+        }
+
         void Module::checkIpStatus()
         {
             if (_ipShown || !established()) return;
+
+            if (_ipStableSince == 0) _ipStableSince = millis();
+            if ((uint32_t)(millis() - _ipStableSince) < NET_INFO_STABLE_MS) return;
+
+            _establishedSinceSec = uptime();
+
+            // A multicast membership does not survive every link change; 03_08_02 Core 4.2 requires the
+            // server to stay discoverable. The BAU knows whether it owns an endpoint.
+            if (!knx.bau().networkChanged(_linkEverDown))
+            {
+                logErrorP("KNXnet/IP endpoint down: multicast join failed - device is not discoverable");
+                _ipStableSince = 0; // leaves _ipShown false: the next tick tries again
+                return;
+            }
+
             logBegin();
             logInfoP("Network established");
             logIndentUp();
@@ -558,12 +655,43 @@ namespace OpenKNX
             _ipShown = true;
         }
 
+        // 03_08_03 3.5.3 p.20: the IP-fault bit of PID_KNXNETIP_DEVICE_STATE is set once communication to the
+        // IP network has failed for five seconds and cleared when it resumes. established() is the accurate
+        // source (physical link up AND an address assigned); the current IP address alone would miss a cable
+        // pull on a static configuration. Read-modify-write so the KNX-fault bit the stack owns is preserved,
+        // and only on a change so the evented M_PropInfo.ind fires on the edge, not every 500 ms.
+        void Module::checkKnxIpDeviceState(bool established)
+        {
+            const uint32_t now = millis();
+
+            if (established)
+                _ipFaultSince = 0;
+            else if (_ipFaultSince == 0)
+                _ipFaultSince = now ? now : 1; // 0 marks "no fault pending", so never store it as a timestamp
+
+            const bool fault = (_ipFaultSince != 0) && (now - _ipFaultSince >= 5000);
+            if (fault == _ipFaultReported)
+                return; // edge only: GetByteProperty() allocates, and this runs twice a second
+            _ipFaultReported = fault;
+
+            const uint8_t current = GetByteProperty(PID_KNXNETIP_DEVICE_STATE);
+            const uint8_t next = fault ? (uint8_t)(current | 0x02) : (uint8_t)(current & ~0x02);
+            if (next != current)
+                SetByteProperty(PID_KNXNETIP_DEVICE_STATE, next);
+        }
+
         void Module::checkLinkStatus()
         {
             if (!delayCheckMillis(_lastLinkCheck, 500)) return;
+            // One carrier read per tick, debounced where it can glitch; everything below derives from it
+            // instead of re-reading PHYCFGR, so a single garbled read cannot flip half the tick's decisions.
+            const bool carrier = linkCarrier();
+            const bool establishedState = carrier && (localIP() != IPAddress());
 
-            // Get current network state
-            bool establishedState = established();
+            // 03_08_03 3.5.3: the IP-fault bit means "IP network cannot be accessed" -- a link with an
+            // address but no KNXnet/IP endpoint is exactly that, so it has to feed this too.
+            checkKnxIpDeviceState(establishedState && knxIpEnabled());
+
 
 #ifdef ARDUINO_ARCH_ESP32
             // Level-triggered: follows the link state every tick, so a failing join is retried every 500 ms.
@@ -579,13 +707,9 @@ namespace OpenKNX
 #endif
 #endif
 
-            bool newLinkState;
-            if (establishedState)
-                newLinkState = true;
-            else
-                newLinkState = connected();
+            const bool newLinkState = establishedState || carrier;
 
-            if (newLinkState && established())
+            if (newLinkState && establishedState)
             {
                 if (_ipLedState != 1)
                 {
@@ -634,7 +758,22 @@ namespace OpenKNX
             // got link
             if (newLinkState && !_currentLinkState)
             {
-                logInfoP("Link connected");
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
+                setLwipLinkState(true); // DHCP: REBOOTING (reclaims the lease) -> DISCOVER -> AutoIP
+#endif
+                _linkUpSinceSec = uptime();
+                if (_linkEverDown)
+                {
+                    _lastDowntimeSec = _linkUpSinceSec - _linkDownSinceSec;
+                    if (_reconnects < 0xFFFF) _reconnects++;
+                    logInfoP("Link connected (down %us, reconnect #%u)",
+                             (unsigned)_lastDowntimeSec, (unsigned)_reconnects);
+                }
+                else
+                {
+                    logInfoP("Link connected");
+                }
+                _linkDownSinceSec = 0;
                 // #if defined(KNX_IP_W5500)
                 // ethernet_arch_lwip_begin();
                 // netif_set_link_up(KNX_NETIF.getNetIf());
@@ -651,14 +790,7 @@ namespace OpenKNX
             // lost link
             else if (!newLinkState && _currentLinkState)
             {
-                _ipShown = false;
-#if defined(KNX_IP_W5500)
-                // ethernet_arch_lwip_begin();
-                // netif_set_ipaddr(KNX_NETIF.getNetIf(), 0);
-                // netif_set_link_down(KNX_NETIF.getNetIf());
-                // ethernet_arch_lwip_end();
-#endif
-                loadCallbacks(false);
+                onLinkLost();
                 logInfoP("Link disconnected");
             }
 
@@ -687,6 +819,10 @@ namespace OpenKNX
 
             if (_powerSave) return;
 
+            // During OTA the async IRQ pump owns W5500 RX; skip the SPI health-checks (checkEthHealth/
+            // checkLinkStatus, and the ping/DNS/webclient loops below) so they don't contend for the SPI bus +
+            // lwIP lock in the windows between flash commits. The device is dedicated to the update anyway.
+            if (_otaActive) return;
 #ifdef OPENKNX_PING
             _pingHandler.loop();
 #endif
@@ -823,7 +959,8 @@ namespace OpenKNX
             data[2] = IPAddress[2];
             data[3] = IPAddress[3];
 
-            knx.bau().propertyValueWrite(OT_IP_PARAMETER, 0, PropertyId, NoOfElem, 1, data, 0);
+            // length is the payload we pass; the bau rejects a write shorter than NoOfElem*ElementSize() (0 = silent drop).
+            knx.bau().propertyValueWrite(OT_IP_PARAMETER, 0, PropertyId, NoOfElem, 1, data, sizeof(data));
         }
 
         uint8_t Module::GetByteProperty(uint8_t PropertyId)
@@ -844,7 +981,8 @@ namespace OpenKNX
 
             data[0] = value;
 
-            knx.bau().propertyValueWrite(OT_IP_PARAMETER, 0, PropertyId, NoOfElem, 1, data, 0);
+            // see SetIpProperty: the payload length is an INPUT the bau bounds the write against, not an output.
+            knx.bau().propertyValueWrite(OT_IP_PARAMETER, 0, PropertyId, NoOfElem, 1, data, sizeof(data));
         }
 
         void Module::registerCallback(NetworkChangeCallback cb)
@@ -1051,6 +1189,24 @@ namespace OpenKNX
 
             if (console)
             {
+                if (_currentLinkState)
+                {
+                    // counts from the carrier edge, shown even while disconnected (the DHCP/AutoIP wait state).
+                    logInfoP("Link-Uptime: %s", humanDuration(netUptimeSec()).c_str());
+                    // only when the IP arrived noticeably after the link (slow DHCP / late renew).
+                    const uint32_t established = netEstablishedSec();
+                    if (established > 0 && (netUptimeSec() - established) >= 5)
+                        logInfoP("IP established: %s", humanDuration(established).c_str());
+                }
+                else if (_linkEverDown)
+                {
+                    logInfoP("Down since: %s", humanDuration(netDowntimeSec()).c_str());
+                }
+
+                if (_reconnects > 0)
+                    logInfoP("Reconnects: %u (last down %s)", (unsigned)_reconnects,
+                             humanDuration(_lastDowntimeSec).c_str());
+
                 logIndentDown();
             }
             logEnd();
@@ -1115,6 +1271,21 @@ namespace OpenKNX
             if (!connected()) return false;
 
             return localIP() != IPAddress();
+        }
+
+        uint32_t Module::netUptimeSec() const
+        {
+            return _currentLinkState ? (uptime() - _linkUpSinceSec) : 0;
+        }
+
+        uint32_t Module::netDowntimeSec() const
+        {
+            return (!_currentLinkState && _linkEverDown) ? (uptime() - _linkDownSinceSec) : 0;
+        }
+
+        uint32_t Module::netEstablishedSec() const
+        {
+            return _ipShown ? (uptime() - _establishedSinceSec) : 0;
         }
 
         IPAddress Module::localIP()

@@ -132,6 +132,13 @@ namespace OpenKNX
             std::string phyMode();
             void macAddress(uint8_t *addr);
             const char *hostName() const { return _hostName; }
+
+            // Connection age + reconnect history, in uptime() seconds (monotonic; millis() wraps at 49.7 d).
+            uint32_t netUptimeSec() const;      // since the link came up; 0 = link down
+            uint32_t netDowntimeSec() const;    // since the link went down; 0 = link up or never down
+            uint32_t netEstablishedSec() const; // since IP was established; 0 = not established
+            uint32_t netLastDowntimeSec() const { return _lastDowntimeSec; }
+            uint16_t netReconnects() const { return _reconnects; }
 #if MASK_VERSION == 0x091A || MASK_VERSION == 0x57B0
             void setMulticastAddress(IPAddress address, bool rebootToTakeEffect);
 #endif
@@ -196,6 +203,7 @@ namespace OpenKNX
 
             bool _powerSave = false;
             bool _ipShown = false;
+            uint32_t _ipStableSince = 0; // link-established timestamp; debounces the "established" + IP-info output
             bool _useStaticIP = false;
             bool _useMDNS = false;
             bool _otaAllowed = false;
@@ -211,6 +219,7 @@ namespace OpenKNX
             const char *_otaPortString = "2040";
 #endif
             uint8_t _otaProgress = 0;
+            bool _otaActive = false;  // true while an OTA update runs (onStart..onEnd/onError) -> display overlay
             IPAddress _staticLocalIP;
             IPAddress _staticSubnetMask;
             IPAddress _staticGatewayIP;
@@ -234,9 +243,35 @@ namespace OpenKNX
             char *_mDNSDeviceServiceName = nullptr;
             char *_mDNSDeviceServiceNameTXT = nullptr;
             bool _currentLinkState = false;
+            bool linkCarrier(); // carrier for the link edge logic, debounced where the read can glitch
+#if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
+            // The carrier comes from a PHYCFGR read over the same SPI bus the driver uses. A single garbled
+            // read was taken at face value and tore the lwIP link down, which drops the DHCP binding -- the
+            // device then sat without an address until a reboot while the PHY never lost carrier.
+            // checkEthHealth() debounces VERSIONR for exactly this reason; this path did not.
+            bool _carrierStable = false; // accepted carrier state
+            uint8_t _carrierSamples = 0; // consecutive reads disagreeing with _carrierStable
+            static constexpr uint8_t LINK_DEBOUNCE_SAMPLES = 3; // 3 x 500ms tick -> 1.5s to accept a change
+#endif
             uint32_t _lastLinkCheck = false;
+            uint32_t _ipFaultSince = 0; // millis() the IP network first looked unreachable; 0 = it does not
+            bool _ipFaultReported = false; // last value written to the IP-fault bit; edge-only, keeps the 2 Hz tick allocation-free
             uint32_t _restartTimer = 0;
 
+            // uptime() seconds; up/down comes from _currentLinkState/_ipShown, not a zero stamp.
+            uint32_t _linkUpSinceSec = 0;      // last link-up edge
+            uint32_t _linkDownSinceSec = 0;    // last link-down edge
+            uint32_t _establishedSinceSec = 0; // moment "Network established" was reached
+            uint32_t _lastDowntimeSec = 0;     // length of the last outage
+            uint32_t _lastLinkUptimeSec = 0;   // how long the link had been up when it last went down
+            uint16_t _reconnects = 0;          // link-up edges after the first one
+            bool _linkEverDown = false;        // the first link-up is a connect, not a reconnect
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
+            // Feed PHY link edges to lwIP; arduino-pico's W5500 driver doesn't, leaving DHCP on a stale lease.
+            void setLwipLinkState(bool up);
+#endif
+            // Link-loss bookkeeping, shared by the normal down edge and the W5500 recovery.
+            void onLinkLost();
             void initPhy();
             void initIp();
             void loadSettings();
@@ -246,6 +281,7 @@ namespace OpenKNX
             void handleMDNS();
             void handleOTA();
             void controlKnxIp(bool state);
+            void checkKnxIpDeviceState(bool established); // feeds the IP-fault bit of PID_KNXNETIP_DEVICE_STATE
             bool knxIpEnabled();     // is the KNXnet/IP datalink layer currently enabled?
 
 #ifdef OPENKNX_PING
