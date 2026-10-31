@@ -15,6 +15,11 @@
         #include <lwip/tcpip.h>
     #endif
 #endif
+#ifdef DEVICE_DISPLAY_MODULE
+    #include "DeviceDisplay.h"
+    #include "Widgets/WidgetNetSpeed.h"
+    #include "Widgets/WidgetNetInfo.h"
+#endif
 
 // ESP32's prebuilt IDF ships autoip.c compiled out, so a -D cannot enable AutoIP -- guard against
 // reporting a method the stack can't do. See doc/TODO-esp32-custom-idf.md. RP2040 builds lwIP from source.
@@ -331,6 +336,30 @@ namespace OpenKNX
                 delete[] friendlyNameRead; // propertyValueRead() allocates the buffer, we have to free it
             }
 
+#ifdef DEVICE_DISPLAY_MODULE
+            // Local on-device override (DeviceDisplay menu) wins over the ETS/property result computed above.
+            if (_localOverride.overrideActive)
+            {
+                _useStaticIP = _localOverride.useStaticIP;
+                logInfoP("Local network override active (%s)", _useStaticIP ? "static IP" : "DHCP");
+                if (_useStaticIP)
+                {
+                    _staticLocalIP = IPAddress(_localOverride.ip[0], _localOverride.ip[1], _localOverride.ip[2], _localOverride.ip[3]);
+                    _staticSubnetMask = IPAddress(_localOverride.subnet[0], _localOverride.subnet[1], _localOverride.subnet[2], _localOverride.subnet[3]);
+                    _staticGatewayIP = IPAddress(_localOverride.gateway[0], _localOverride.gateway[1], _localOverride.gateway[2], _localOverride.gateway[3]);
+                    _staticNameServerIP = IPAddress(_localOverride.dns[0], _localOverride.dns[1], _localOverride.dns[2], _localOverride.dns[3]);
+                }
+                else
+                {
+                    // DHCP: clear any previously computed static config so initIp() requests a lease.
+                    _staticLocalIP = IPAddress();
+                    _staticSubnetMask = IPAddress();
+                    _staticGatewayIP = IPAddress();
+                    _staticNameServerIP = IPAddress();
+                }
+            }
+#endif
+
             // PID_IP_CAPABILITIES = which AUTOMATIC assignment methods this IP stack can do (03_08_03 2.5.7: bit0 BootP,
             // bit1 DHCP, bit2 AutoIP; manual is always implicit and has no bit). Set UNCONDITIONALLY: capabilities are
             // fixed and do not depend on the current config.
@@ -584,6 +613,7 @@ namespace OpenKNX
             ArduinoOTA.setRebootOnSuccess(false);
             ArduinoOTA.onStart([&]() {
                 _otaActive = true; // display OTA overlay takes over (SYSTEM priority)
+                _otaPercent = 0;
 #if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
                 phyToolAbort(); // loop() returns before the state machine while OTA runs
 #endif
@@ -594,13 +624,15 @@ namespace OpenKNX
             });
             ArduinoOTA.onEnd([&]() {
                 _otaActive = false;
+                _otaPercent = 100;
                 logIndentUp();
                 logInfo("OTA", "Update complete");
                 logIndentDown();
                 openknx.restart();
             });
             ArduinoOTA.onProgress([&](unsigned int progress, unsigned int total) {
-                int percent = (int)progress / (total / 100.0);
+                int percent = (total > 0) ? (int)((uint64_t)progress * 100u / total) : 0; // div-by-zero-safe
+                _otaPercent = (percent < 0) ? 0 : (percent > 100 ? 100 : percent);         // fine bar for the display overlay
                 if (percent % 10 == 0 && _otaProgress != percent)
                 {
                     logIndentUp();
@@ -1071,6 +1103,26 @@ namespace OpenKNX
 
         void Module::loop(bool configured)
         {
+#ifdef DEVICE_DISPLAY_MODULE
+            // The LAN-speed widget ships with this module because the packet counters live here.
+            // Registered from loop(), not setup(): this module is number 7 and DeviceDisplay is 10,
+            // so in setup() the widget manager has no display yet and the widget would be dropped.
+            if (!_netSpeedWidgetAdded && openknxDisplayModule.getWidgetManager() != nullptr)
+            {
+                _netSpeedWidgetAdded = true;
+                auto *netSpeed = new WidgetNetSpeed(10000, WidgetFlags::DefaultWidget);
+                netSpeed->setName("LAN-Speed");
+                if (!openknxDisplayModule.tryAddWidget(netSpeed))
+                    logDebugP("WidgetNetSpeed not registered (no display/manager)");
+
+                // Host, IP and link state also belong to this module, not to the system-info
+                // widget of OGM-Common, which must not reach into OFM-Network.
+                auto *netInfo = new WidgetNetInfo(10000, WidgetFlags::DefaultWidget);
+                netInfo->setName("Network");
+                if (!openknxDisplayModule.tryAddWidget(netInfo))
+                    logDebugP("WidgetNetInfo not registered (no display/manager)");
+            }
+#endif
 #ifdef ARDUINO_ARCH_ESP32
             // Ahead of the _powerSave/_otaActive returns, so KNX-IP follows the network in every state.
             if (_knxIpRequest.load(std::memory_order_relaxed)) applyKnxIpRequest();
@@ -2031,7 +2083,11 @@ namespace OpenKNX
         // Total module-flash footprint: shared ETH-link bytes (if any) + the local-override block (DEVICE_DISPLAY).
         uint16_t Module::flashSize()
         {
+#ifdef DEVICE_DISPLAY_MODULE
+            return NET_ETHLINK_FLASH_SIZE + NET_OVERRIDE_FLASH_SIZE;
+#else
             return NET_ETHLINK_FLASH_SIZE;
+#endif
         }
 
         // Write order MUST match read order: EthLink bytes first (unchanged), then the override block.
@@ -2040,6 +2096,9 @@ namespace OpenKNX
 #if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
             _ethLink.writeFlash();
 #endif
+#ifdef DEVICE_DISPLAY_MODULE
+            writeLocalOverrideFlash();
+#endif
         }
 
         void Module::readFlash(const uint8_t *data, const uint16_t size)
@@ -2047,7 +2106,108 @@ namespace OpenKNX
 #if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
             _ethLink.readFlash(data, size); // tolerates a shorter/older blob (keeps its own defaults)
 #endif
+#ifdef DEVICE_DISPLAY_MODULE
+            if (size <= NET_ETHLINK_FLASH_SIZE)
+                readLocalOverrideFlash(nullptr, 0); // no override bytes stored -> defined defaults
+            else
+                readLocalOverrideFlash(data + NET_ETHLINK_FLASH_SIZE, size - NET_ETHLINK_FLASH_SIZE);
+#endif
         }
+
+#ifdef DEVICE_DISPLAY_MODULE
+        void Module::writeLocalOverrideFlash()
+        {
+            openknx.flash.writeByte(_localOverride.version);
+            openknx.flash.writeByte(_localOverride.overrideActive ? 1 : 0);
+            openknx.flash.writeByte(_localOverride.useStaticIP ? 1 : 0);
+            for (uint8_t i = 0; i < 4; i++) openknx.flash.writeByte(_localOverride.ip[i]);
+            for (uint8_t i = 0; i < 4; i++) openknx.flash.writeByte(_localOverride.subnet[i]);
+            for (uint8_t i = 0; i < 4; i++) openknx.flash.writeByte(_localOverride.gateway[i]);
+            for (uint8_t i = 0; i < 4; i++) openknx.flash.writeByte(_localOverride.dns[i]);
+            openknx.flash.writeByte(_localOverride.linkMode);
+        }
+
+        void Module::readLocalOverrideFlash(const uint8_t *data, const uint16_t size)
+        {
+            _localOverride = NetworkLocalOverride(); // reset to defined defaults first
+            if (data == nullptr || size < NET_OVERRIDE_FLASH_SIZE) return;
+            if (data[0] != _localOverride.version) return; // unknown format version -> keep defaults
+
+            uint16_t p = 0;
+            _localOverride.version = data[p++];
+            _localOverride.overrideActive = (data[p++] != 0);
+            _localOverride.useStaticIP = (data[p++] != 0);
+            for (uint8_t i = 0; i < 4; i++) _localOverride.ip[i] = data[p++];
+            for (uint8_t i = 0; i < 4; i++) _localOverride.subnet[i] = data[p++];
+            for (uint8_t i = 0; i < 4; i++) _localOverride.gateway[i] = data[p++];
+            for (uint8_t i = 0; i < 4; i++) _localOverride.dns[i] = data[p++];
+            _localOverride.linkMode = data[p++];
+        }
+
+        void Module::prefillZeroQuartet(uint8_t (&quartet)[4], IPAddress live)
+        {
+            if (quartet[0] || quartet[1] || quartet[2] || quartet[3]) return; // already set -> keep it
+            for (uint8_t i = 0; i < 4; i++) quartet[i] = live[i];
+        }
+
+        void Module::setLocalStaticIpEnabled(bool enabled)
+        {
+            _localOverride.overrideActive = true;
+            _localOverride.useStaticIP = enabled;
+            if (enabled) // pre-fill any still-zero quartet from the live lease so the menu shows sane values
+            {
+                prefillZeroQuartet(_localOverride.ip, localIP());
+                prefillZeroQuartet(_localOverride.subnet, subnetMask());
+                prefillZeroQuartet(_localOverride.gateway, gatewayIP());
+                prefillZeroQuartet(_localOverride.dns, nameServerIP());
+            }
+        }
+
+        void Module::setLocalIp(IPAddress ip)
+        {
+            _localOverride.overrideActive = true;
+            for (uint8_t i = 0; i < 4; i++) _localOverride.ip[i] = ip[i];
+        }
+
+        void Module::setLocalSubnet(IPAddress subnet)
+        {
+            _localOverride.overrideActive = true;
+            for (uint8_t i = 0; i < 4; i++) _localOverride.subnet[i] = subnet[i];
+        }
+
+        void Module::setLocalGateway(IPAddress gateway)
+        {
+            _localOverride.overrideActive = true;
+            for (uint8_t i = 0; i < 4; i++) _localOverride.gateway[i] = gateway[i];
+        }
+
+        void Module::setLocalDns(IPAddress dns)
+        {
+            _localOverride.overrideActive = true;
+            for (uint8_t i = 0; i < 4; i++) _localOverride.dns[i] = dns[i];
+        }
+
+        bool Module::localOverrideActive() { return _localOverride.overrideActive; }
+
+        bool Module::localUsesStaticIp()
+        {
+            return _localOverride.overrideActive ? _localOverride.useStaticIP : _useStaticIP;
+        }
+
+        void Module::applyLocalNetworkConfig(bool rebootToTakeEffect)
+        {
+            logInfoP("Apply local network override (%s, %s)", _localOverride.useStaticIP ? "static IP" : "DHCP",
+                     rebootToTakeEffect ? "reboot" : "live");
+            openknx.flash.save(true); // persist now -> triggers Module::writeFlash() (EthLink bytes + override block)
+            if (rebootToTakeEffect)
+            {
+                _restartTimer = delayTimerInit(); // loop() reboots ~2 s later
+                return;
+            }
+            loadSettings();
+            resetNetwork();
+        }
+#endif // DEVICE_DISPLAY_MODULE
 
 #if defined(ARDUINO_ARCH_RP2040) && defined(OPENKNX_ETH_W5500) && defined(KNX_IP_LAN)
         // Hardware-reset the W5500 via RSTn. NOT the driver's end() (busy-waits forever on a stuck chip -> brick).
