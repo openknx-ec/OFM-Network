@@ -7,6 +7,15 @@
 #include "DNS.h"
 #include "Module.h"
 
+#if defined(KNX_IP_LAN) || defined(KNX_IP_WIFI)
+    #include <lwip/igmp.h>
+    #include <lwip/netif.h>
+    #ifdef ARDUINO_ARCH_ESP32
+        #include <esp_netif.h>
+        #include <lwip/tcpip.h>
+    #endif
+#endif
+
 // ESP32's prebuilt IDF ships autoip.c compiled out, so a -D cannot enable AutoIP -- guard against
 // reporting a method the stack can't do. See doc/TODO-esp32-custom-idf.md. RP2040 builds lwIP from source.
 #if defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_NETWORK_AUTOIP)
@@ -81,6 +90,80 @@ static void _openknxMdnsTxtCb(struct mdns_service *service, void *txt_userdata)
 WiFiUDP Udp;
 #else
 #pragma warn "Unsupported platform"
+#endif
+
+// Total LAN packet counters. Consumers: the DeviceDisplay net-speed widget, the overview page and the
+// `net` console output. Bytes aren't available (lwIP MIB2 is off in the prebuilt core), so packets are the
+// whole-interface figure.
+#if defined(ARDUINO_ARCH_RP2040) && defined(KNX_IP_LAN)
+void openknxLanTraffic(uint32_t &rxPackets, uint32_t &txPackets)
+{
+    rxPackets = KNX_NETIF.packetsReceived();
+    txPackets = KNX_NETIF.packetsSent();
+}
+#elif defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_NET_HAVE_LAN_TRAFFIC)
+// ESP32: the netif's input and linkoutput are wrapped by two counting functions. Both run with the lwIP
+// core held, so the increments do not race; a reader takes a 32-bit snapshot.
+static volatile uint32_t lanRxPackets = 0;
+static volatile uint32_t lanTxPackets = 0;
+static netif_input_fn lanOrigInput = nullptr;
+static netif_linkoutput_fn lanOrigLinkOutput = nullptr;
+static netif *lanHooked = nullptr;
+
+static err_t lanCountInput(struct pbuf *p, struct netif *inp)
+{
+    lanRxPackets = lanRxPackets + 1;
+    return lanOrigInput(p, inp);
+}
+
+static err_t lanCountLinkOutput(struct netif *n, struct pbuf *p)
+{
+    lanTxPackets = lanTxPackets + 1;
+    return lanOrigLinkOutput(n, p);
+}
+
+/**
+ * @brief Wraps the netif with the given index; runs in the tcpip task, a no-op when it is wrapped already.
+ * A netif created anew gets wrapped again, and a wrapped one that is still listed is restored first.
+ */
+static void lanHookNetif(void *arg)
+{
+    netif *n = netif_get_by_index((u8_t)(uintptr_t)arg);
+    if (n == nullptr || n->input == nullptr || n->linkoutput == nullptr) return;
+    if (n == lanHooked && n->input == lanCountInput && n->linkoutput == lanCountLinkOutput) return;
+
+    netif *it;
+    NETIF_FOREACH(it)
+    {
+        if (it != lanHooked) continue;
+        if (it->input == lanCountInput) it->input = lanOrigInput;
+        if (it->linkoutput == lanCountLinkOutput) it->linkoutput = lanOrigLinkOutput;
+    }
+    lanOrigInput = n->input;
+    lanOrigLinkOutput = n->linkoutput;
+    n->input = lanCountInput;
+    n->linkoutput = lanCountLinkOutput;
+    lanHooked = n;
+}
+
+/** @brief Asks the tcpip task every 2 s to make sure the KNX netif is wrapped. */
+static void lanTrafficService()
+{
+    static uint32_t last = 0;
+    if (!delayCheckMillis(last, 2000)) return;
+    last = millis();
+    esp_netif_t *en = KNX_NETIF.netif();
+    if (en == nullptr) return;
+    const int idx = esp_netif_get_netif_impl_index(en);
+    if (idx <= 0) return;
+    tcpip_try_callback(lanHookNetif, (void *)(uintptr_t)idx);
+}
+
+void openknxLanTraffic(uint32_t &rxPackets, uint32_t &txPackets)
+{
+    rxPackets = lanRxPackets;
+    txPackets = lanTxPackets;
+}
 #endif
 
 // mDNS "otamode" TXT value from the ETS OTA-Update setting (ParamNET_OTAUpdate): prog | always | off.
@@ -748,6 +831,10 @@ namespace OpenKNX
         void Module::checkLinkStatus()
         {
             if (!delayCheckMillis(_lastLinkCheck, 500)) return;
+#if defined(ARDUINO_ARCH_ESP32) && defined(OPENKNX_NET_HAVE_LAN_TRAFFIC)
+            lanTrafficService();
+#endif
+
             // KNX-IP-Status LED (func 11): reflects the KNXnet/IP datalink, separate from the physical-link LED below.
             checkKnxIpStatus();
 
@@ -1264,6 +1351,16 @@ namespace OpenKNX
                 logInfoP("Netmask: %s", subnetMask().toString().c_str());
                 logInfoP("Gateway: %s", gatewayIP().toString().c_str());
                 logInfoP("DNS: %s", nameServerIP().toString().c_str());
+#ifdef OPENKNX_NET_HAVE_LAN_TRAFFIC
+                {
+                    // Whole-interface packet totals since boot. Compact units: the raw counters reach
+                    // eight digits within days on a busy segment.
+                    uint32_t rxPackets = 0, txPackets = 0;
+                    openknxLanTraffic(rxPackets, txPackets);
+                    logInfoP("Packets RX/TX: %s / %s", humanCount(rxPackets).c_str(),
+                             humanCount(txPackets).c_str());
+                }
+#endif
                 // logInfoP("Mode: %s", phyMode().c_str()); currently not supported
 
 #ifdef KNX_IP_WIFI

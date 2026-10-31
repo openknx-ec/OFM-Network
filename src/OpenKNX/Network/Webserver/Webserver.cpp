@@ -285,6 +285,13 @@ namespace OpenKNX
                                            : "–", "ov-mask");
                 row("Gateway", net ? openknxNetwork.gatewayIP().toString().c_str()
                                            : "–", "ov-gw");
+#ifdef OPENKNX_NET_HAVE_LAN_TRAFFIC
+                {
+                    uint32_t rxPackets = 0, txPackets = 0;
+                    openknxLanTraffic(rxPackets, txPackets);
+                    row("Pakete RX/TX", humanCount(rxPackets) + " / " + humanCount(txPackets));
+                }
+#endif
                 row("DNS", net ? openknxNetwork.nameServerIP().toString().c_str()
                                        : "–", "ov-dns");
                 page += "</tbody></table>";
